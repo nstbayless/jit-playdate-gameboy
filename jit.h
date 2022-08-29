@@ -1,27 +1,34 @@
 #pragma once
 
+#include "pd_api.h"
 #include <stdint.h>
 
 typedef void (*jit_fn)(void);
 
 typedef struct
 {
+    uint16_t af, bc, de, hl, sp, pc;
+} jit_regfile;
+
+typedef struct
+{
     const void* rom;
-    const void (*stop)(void);
-    const void (*halt)(void);
-    const void (*illegal)(void);
-    uint16_t* reg_af; // F: ZNHC0000
-    uint16_t* reg_bc;
-    uint16_t* reg_de;
-    uint16_t* reg_hl;
-    uint16_t* reg_sp;
-    uint16_t* reg_pc;
+    void* wram;
+    void* hram;
+    void (*stop)(void);
+    void (*halt)(void);
+    void (*illegal)(void);
+    uint8_t (*read)(uint16_t addr);
+    void (*write)(uint16_t addr, uint8_t value);
+    jit_regfile* regs;
+    unsigned is_gb_color : 1;
+    PlaydateAPI* playdate;
 } jit_opts;
 
 void jit_init(jit_opts opts);
 void jit_cleanup(void);
 
-// call this every frame at start of frame.
+// call this at least once every frame at start of frame.
 void jit_memfix(void);
 
 // returns NULL in case of error.

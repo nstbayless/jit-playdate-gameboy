@@ -1,10 +1,13 @@
 #include "jit.h"
 
-// NOTE: mem.h may be missing. It is not checked into version control.
-// it contains two functions: memfix() and flush_icache()
-// Please ask author for this file, or implement it yourself.
+#define JIT_DEBUG
+
 #ifdef TARGET_PLAYDATE
-    #include "mem.h"
+    #ifdef __FPU_USED
+        #undef __FPU_USED
+    #endif
+    #define STM32F746xx
+    #include "stm32f7xx.h" 
 #endif
 
 #include <stdint.h>
@@ -12,6 +15,13 @@
 #include <string.h>
 
 #define JIT_HASHTABLE_SIZE 0x4000 // must be power of 2, at most 0x8000
+#define JIT_START_PADDING_ENTRY_C 10
+
+#ifdef JIT_DEBUG
+#define JIT_DEBUG_MESSAGE(...) do {opts.playdate->system->logToConsole(__VA_ARGS__); spin();} while(0)
+#else
+#define JIT_DEBUG_MESSAGE(...)
+#endif
 
 typedef struct
 {
@@ -49,7 +59,25 @@ typedef enum
 static jit_opts opts;
 static jit_ht_entry* jit_hashtable[JIT_HASHTABLE_SIZE];
 
-static jit_fn jit_add_ht_entry(uint16_t gb_addr, uint16_t gb_bank, jit_fn fn)
+static void* arm_interworking_none(void* addr)
+{
+	#ifdef TARGET_PLAYDATE
+	return (void*)((uintptr_t)addr & ~1);
+	#else
+	return addr;
+	#endif
+}
+
+static void* arm_interworking_thumb(void* fn)
+{
+    #if TARGET_PLAYDATE
+    return (void*)((uintptr_t)fn | 1);
+    #else
+    return fn;
+    #endif
+}
+
+static void jit_add_ht_entry(uint16_t gb_addr, uint16_t gb_bank, jit_fn fn)
 {
     uint16_t hash_entry = (gb_addr) % JIT_HASHTABLE_SIZE;
     jit_ht_entry* prev = jit_hashtable[hash_entry];
@@ -96,10 +124,20 @@ static jit_fn get_jit_fn(uint16_t gb_addr, uint16_t gb_bank)
     return NULL;
 }
 
+#ifdef JIT_DEBUG
+static void spin(void)
+{
+    for (size_t i = 0; i < 0x40000; ++i) asm("nop");
+}
+#endif
+
 void jit_init(jit_opts _opts)
 {
-    memset(jit_hashtable, 0, sizeof(jit_hashtable));
     opts = _opts;
+    JIT_DEBUG_MESSAGE("memset.\n");
+    memset(jit_hashtable, 0, sizeof(jit_hashtable));
+    JIT_DEBUG_MESSAGE("memfix.\n");
+    jit_memfix();
 }
 
 void jit_cleanup(void)
@@ -110,7 +148,7 @@ void jit_cleanup(void)
         {
             for (jit_ht_entry* e = jit_hashtable[i]; e->fn; ++e)
             {
-                free((void*)e->fn);
+                free(arm_interworking_none(e->fn));
             }
             free(jit_hashtable[i]);
         }
@@ -121,38 +159,129 @@ void jit_cleanup(void)
 void jit_memfix(void)
 {
     #ifdef TARGET_PLAYDATE
-    memfix();
+    //memfix();
     #endif
 }
 
+typedef struct {
+    void* args;
+    
+    // if `outbuff` is NULL, don't actually write anything.
+    // return size of (what would be) written
+    uint8_t (*produce)(void* args, uint16_t* outbuff);
+} armop;
+
 // disassembly state.
 static struct {
-    uint16_t* arm;
+    armop* arm;
     uint16_t armc;
     uint16_t armcap;
+    const uint8_t* romstart;
     const uint8_t* rom;
     const uint8_t* romend;
     unsigned done : 1;
+    unsigned error : 1;
+    unsigned use_r0: 1;
+    unsigned use_r1: 1;
 } dis;
 
-// call function directly.
-static void dis_delegate(const void (*fn)(void))
+static uint32_t swap16_32(uint32_t a)
 {
+    return ((a >> 16) & 0x0000ffff) | ((a << 16) & 0xffff0000);
 }
 
-static int dis_set_n()
+#define WRITE_BUFF_INIT() uint16_t* const outbuff_base = outbuff;
+#define WRITE_BUFF_16(arg) do { if (outbuff_base) *(uint16_t*)(void*)outbuff=(arg); outbuff += 1; } while(0)
+#define WRITE_BUFF_32(arg) do { if (outbuff_base) *(uint32_t*)(void*)outbuff=swap16_32(arg); outbuff += 2; } while(0)
+#define WRITE_BUFF_END() ((uintptr_t)outbuff - (uintptr_t)outbuff_base) / sizeof(*outbuff)
+
+static uint8_t disp_skip(void* args, uint16_t* outbuff)
+{
+    return 0;
+}
+
+static uint8_t disp_16(void* args, uint16_t* outbuff)
+{
+    WRITE_BUFF_INIT();
+    WRITE_BUFF_16((uintptr_t)args);
+    return WRITE_BUFF_END();
+}
+
+static uint8_t disp_32(void* args, uint16_t* outbuff)
+{
+    WRITE_BUFF_INIT();
+    WRITE_BUFF_32((uintptr_t)args);
+    return WRITE_BUFF_END();
+}
+
+#define ARMOP(...) ({armop op = {__VA_ARGS__}; op;})
+
+static void dis_instr16(uint16_t instr)
+{
+    dis.arm[dis.armc++] = ARMOP(
+        .args = (void*)(uintptr_t)instr,
+        .produce = disp_16
+    );
+}
+
+void test_stop(void);
+void test_halt(void);
+
+// call function directly.
+static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
+{
+    WRITE_BUFF_INIT();
+    // push {lr}
+    WRITE_BUFF_16(0xB500);
+    
+    // bl fn
+    int32_t rel_addr = ((intptr_t)arm_interworking_none(fn) - (intptr_t)outbuff) / 2 - 2;
+    uint32_t urel_addr = rel_addr;
+    uint32_t sign = rel_addr < 0
+        ? (1 << 26)
+        : 0;
+    uint32_t j2 = (!(urel_addr & (1 << 20)) == !sign)
+        ? 0x800
+        : 0x0000;
+    uint32_t j1 = (!(urel_addr & (1 << 21)) == !sign)
+        ? 0x2000
+        : 0x0000;
+    JIT_DEBUG_MESSAGE("callsite address: %8x", outbuff);
+    JIT_DEBUG_MESSAGE("function address: %8x", fn);
+    JIT_DEBUG_MESSAGE("stop address: %8x", test_stop);
+    JIT_DEBUG_MESSAGE("halt address: %8x", test_halt);
+    JIT_DEBUG_MESSAGE("relative addr: %8x; sign %x, j2 %x, j1 %x\n", urel_addr, sign, j2, j1);
+    WRITE_BUFF_32(
+        0xF000D000 | (urel_addr & 0x7ff) | ((urel_addr << 5) & 0x03ff0000) | j2 | j1 | sign
+    );
+    
+    // pop {lr}
+    WRITE_BUFF_32(0xF85DEB04);
+    
+    return WRITE_BUFF_END();
+}
+
+static void dis_delegate(void (*fn)(void))
+{
+    dis.arm[dis.armc++] = ARMOP(
+        .args = (void*)fn,
+        .produce = disp_delegate
+    );
+}
+
+static void dis_set_n(void)
 {
     // TODO
 }
 
-static int dis_clear_n()
+static void dis_clear_n(void)
 {
     // TODO
 }
 
 static void dis_ld(oparg dst, oparg src)
 {
-    // TODO
+    dis.use_r0 = 1;
 }
 
 static void dis_inc(oparg arg)
@@ -197,35 +326,35 @@ static void dis_ret(oparg condition)
     // TODO
 }
 
-static void dis_reti()
+static void dis_reti(void)
 {
 }
 
 // convert to bcd
-static void dis_daa()
+static void dis_daa(void)
 {
 }
 
 // set carry flag
-static void dis_scf()
+static void dis_scf(void)
 {
 }
 
 // flip carry flag
-static void dis_ccf()
+static void dis_ccf(void)
 {
 }
 
 // one's complement of A
-static void dis_cpl()
+static void dis_cpl(void)
 {
 }
 
-static void dis_di()
+static void dis_di(void)
 {
 }
 
-static void dis_ei()
+static void dis_ei(void)
 {
 }
 
@@ -270,28 +399,42 @@ static void dis_pop(oparg src)
 {
 }
 
-static int disassemble_done()
+static int disassemble_done(void)
 {
+    if (dis.error) return 1;
     if (dis.rom >= dis.romend - 2) return 1;
     return dis.done;
 }
 
-static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_end_offset)
+static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, uint32_t gb_end_offset)
 {
+    memset(&dis, 0, sizeof(dis));
     dis.armcap = 0x100;
-    dis.done = 0;
-    dis.arm = (uint16_t*)malloc(dis.armcap * sizeof(uint16_t));
-    dis.armc = 0;
+    dis.arm = (armop*)malloc(dis.armcap * sizeof(armop));
+    for (size_t i = 0; i < JIT_START_PADDING_ENTRY_C; ++i)
+    {
+        dis.arm[i].produce = disp_skip;
+    }
+    dis.armc = JIT_START_PADDING_ENTRY_C;
     dis.rom = (const uint8_t*)opts.rom + gb_rom_offset;
     dis.romend = (const uint8_t*)opts.rom + gb_end_offset;
+    dis.romstart = (const uint8_t*)opts.rom + gb_start_offset;
 }
 
-static void disassemble_capacity()
+static void disassemble_capacity(void)
 {
     if (dis.armc >= dis.armcap / 2)
     {
         dis.armcap *= 2;
-        dis.arm = (uint16_t*)realloc(dis.arm, dis.armcap * sizeof(uint16_t));
+        armop* arm = (armop*)realloc(dis.arm, dis.armcap * sizeof(armop));
+        if (arm == NULL)
+        {
+            dis.error = 1;
+        }
+        else
+        {
+            dis.arm = arm;
+        }
     }
 }
 
@@ -316,13 +459,16 @@ static oparg arg_from_op(uint8_t op)
         case 7:
             return OPARG_A;
     }
+    
+    // unused
+    return OPARG_A;
 }
 
-static void disassemble_instruction()
+static void disassemble_instruction(void)
 {
     disassemble_capacity();
     uint8_t op;
-    switch (op = *++dis.rom)
+    switch (op = *(dis.rom++))
     {
         case 0x00: // NOP
             return;
@@ -374,6 +520,7 @@ static void disassemble_instruction()
         
         case 0x10: // STOP
             dis.done = 1;
+            JIT_DEBUG_MESSAGE("disassembling STOP");
             return dis_delegate(opts.stop);
             
         case 0x11:
@@ -542,27 +689,28 @@ static void disassemble_instruction()
             
         case 0x76: // HALT
             dis.done = 1;
+            JIT_DEBUG_MESSAGE("disassembling HALT");
             return dis_delegate(opts.halt);
             
         // arithmetic
         case 0x80 ... 0xBF:
-            switch (op / 0x8)
+            switch (op)
             {
-            case 0x80/8:
+            case 0x80 ... 0x87:
                 return dis_add(OPARG_A, arg_from_op(op), 0);
-            case 0x88/8:
+            case 0x88 ... 0x8F:
                 return dis_add(OPARG_A, arg_from_op(op), 1);
-            case 0x90/8:
+            case 0x90 ... 0x97:
                 return dis_sub(OPARG_A, arg_from_op(op), 0);
-            case 0x98/8:
+            case 0x98 ... 0x9F:
                 return dis_sub(OPARG_A, arg_from_op(op), 1);
-            case 0xA0/8:
+            case 0xA0 ... 0xA7:
                 return dis_and(arg_from_op(op));
-            case 0xA8/8:
+            case 0xA8 ... 0xAF:
                 return dis_xor(arg_from_op(op));
-            case 0xB0/8:
+            case 0xB0 ... 0xB7:
                 return dis_or(arg_from_op(op));
-            case 0xB8/8:
+            case 0xB8 ... 0xBF:
                 return dis_cp(arg_from_op(op));
             }
         
@@ -601,7 +749,7 @@ static void disassemble_instruction()
             
         case 0xCB:
             {
-                uint8_t opx = *++dis.rom;
+                uint8_t opx = *(dis.rom++);
                 oparg arg = arg_from_op(opx);
                 switch(opx/8)
                 {
@@ -759,17 +907,52 @@ static void disassemble_instruction()
     }
 }
 
-static void* disassemble_end()
+static void disassemble_padding(void)
 {
-    size_t pad_begin = 0;
-    size_t pad_end = 1;
+    // append a return.
+    dis_instr16(0x4770);
+}
+
+static void* disassemble_end(void)
+{
+    if (dis.error)
+    {
+        if (dis.arm) free(dis.arm);
+        return NULL;
+    }
     
-    uint16_t* out = (uint16_t*)malloc((dis.armc + pad_begin + pad_end) * sizeof(uint16_t));
-    memcpy(out + pad_begin, dis.arm, dis.armc * sizeof(uint16_t));
+    disassemble_padding();
     
-    // append return instruction
-    out[dis.armc + pad_begin] = 0x4770;
-    return out;
+    // accumulate size of output
+    
+    size_t outsize = 0;
+    for (size_t i = 0; i < dis.armc; ++i)
+    {
+        outsize += dis.arm[i].produce(dis.arm[i].args, NULL);
+    }
+    
+    // allocate output buffer
+    uint16_t* const out = (uint16_t*)malloc(outsize * sizeof(uint16_t));
+    uint16_t* outb = out;
+    
+    for (size_t i = 0; i < dis.armc; ++i)
+    {
+        outb += dis.arm[i].produce(dis.arm[i].args, outb);
+    }
+    
+    free(dis.arm);
+    
+    #ifdef JIT_DEBUG
+    JIT_DEBUG_MESSAGE("disassembly: ");
+    for (size_t i = 0; i < outsize; ++i)
+    {
+        opts.playdate->system->logToConsole("%04x ", out[i]);
+    }
+    JIT_DEBUG_MESSAGE(" Done.\n");
+    spin(); spin(); spin();
+    #endif
+    
+    return arm_interworking_thumb(out);
 }
 
 static jit_fn jit_compile(uint16_t gb_addr, uint16_t gb_bank)
@@ -778,15 +961,23 @@ static jit_fn jit_compile(uint16_t gb_addr, uint16_t gb_bank)
     if (gb_addr == 0x7FFF || gb_addr == 0x3FFF || gb_addr == 0x7FFE || gb_addr == 0x3FFE) return NULL;
     
     uint32_t gb_rom_offset = (gb_addr % 0x4000) | ((uint32_t)gb_bank * 0x4000);
+    uint32_t gb_start_offset = (((uint32_t)gb_bank) * 0x4000);
     uint32_t gb_end_offset = (((uint32_t)gb_bank + 1) * 0x4000);
     
-    disassemble_begin(gb_rom_offset, gb_end_offset);
+    disassemble_begin(gb_rom_offset, gb_start_offset, gb_end_offset);
     
     while (!disassemble_done())
     // disassemble each gameboy instruction one at a time.
     {
         disassemble_instruction();
     }
+    
+    jit_fn fn = (jit_fn)disassemble_end();
+    if (!fn) return NULL;
+    
+    jit_add_ht_entry(gb_addr, gb_bank, fn);
+    
+    return (jit_fn)arm_interworking_thumb(fn);
 }
 
 jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank)
@@ -794,7 +985,15 @@ jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank)
     jit_fn f = get_jit_fn(gb_addr, gb_bank);
     if (f) return f;
     
-    // no existing fn
-    return jit_compile(gb_addr, gb_bank);
+    // no existing fn -- create one.
+    jit_fn fn = jit_compile(gb_addr, gb_bank);
+    if (!fn) return NULL;
+    #if TARGET_PLADATE
+    SCB_InvalidateDCache();
+    SCB_InvalidateICache();
+    SCB_InvalidateDCache();
+    SCB_InvalidateICache();
+    #endif
+    return fn;
 }
 
