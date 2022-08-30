@@ -228,6 +228,9 @@ static struct {
     unsigned use_r_hl: 1;
     unsigned init_r_hl : 1;
     unsigned dirty_r_hl : 1;
+    unsigned use_r_sp: 1;
+    unsigned init_r_sp : 1;
+    unsigned dirty_r_sp : 1;
     unsigned use_r_regfile : 1;
 } dis;
 
@@ -294,6 +297,7 @@ static int is_reg16(oparg reg)
     case OPARG_BC:
     case OPARG_DE:
     case OPARG_HL:
+    case OPARG_SP:
         return 1;
     default:
         return 0;
@@ -385,6 +389,18 @@ static void use_register(oparg reg, int dependency, int dirty)
             dis.use_r_hl = 1;
             dis.use_r_regfile = 1;
             break;
+        case OPARG_SP:
+            if (dependency && !dis.use_r_sp)
+            {
+                dis.init_r_sp = 1;
+            }
+            if (dirty)
+            {
+                dis.dirty_r_sp = 1;
+            }
+            dis.use_r_sp = 1;
+            dis.use_r_regfile = 1;
+            break;
         default:
             break;
     }
@@ -455,6 +471,10 @@ static uint8_t used_registers(void)
     if (dis.use_r_hl)
     {
         reg_push |= 1 << REG_HL;
+    }
+    if (dis.use_r_sp)
+    {
+        reg_push |= 1 << REG_SP;
     }
     if (dis.use_r_regfile)
     {
@@ -1553,7 +1573,7 @@ static void disassemble_padding(void)
     {
         prologue_16(
             0x8800
-            | (offsetof(jit_regfile_t, bc) << 6)
+            | (offsetof(jit_regfile_t, bc) << 5)
             | (REG_REGF << 3)
             | (REG_BC << 0)
         );
@@ -1563,7 +1583,7 @@ static void disassemble_padding(void)
     {
         prologue_16(
             0x8800
-            | (offsetof(jit_regfile_t, de) << 6)
+            | (offsetof(jit_regfile_t, de) << 5)
             | (REG_REGF << 3)
             | (REG_DE << 0)
         );
@@ -1573,9 +1593,19 @@ static void disassemble_padding(void)
     {
         prologue_16(
             0x8800
-            | (offsetof(jit_regfile_t, hl) << 6)
+            | (offsetof(jit_regfile_t, hl) << 5)
             | (REG_REGF << 3)
             | (REG_HL << 0)
+        );
+    }
+    
+    if (dis.init_r_sp)
+    {
+        prologue_16(
+            0x8800
+            | (offsetof(jit_regfile_t, sp) << 5)
+            | (REG_REGF << 3)
+            | (REG_SP << 0)
         );
     }
     
@@ -1619,6 +1649,16 @@ static void disassemble_padding(void)
             | (offsetof(jit_regfile_t, hl) << 5)
             | (REG_REGF << 3)
             | (REG_HL << 0)
+        );
+    }
+    
+    if (dis.dirty_r_sp)
+    {
+        epilogue_16(
+            0x8000
+            | (offsetof(jit_regfile_t, sp) << 5)
+            | (REG_REGF << 3)
+            | (REG_SP << 0)
         );
     }
     
