@@ -35,11 +35,13 @@
 #define JIT_DEBUG_MESSAGE(...)
 #endif
 
+// TODO: assign registers programatically
 #define REG_A 0
 #define REG_REGF 1
-#define REG_BC 2
-#define REG_DE 3
-#define REG_HL 4
+#define REG_BC 3
+#define REG_DE 4
+#define REG_HL 2
+#define REG_SP 5
 
 #define offsetof_hi(a, b) (offsetof(a, b) + 1)
 
@@ -115,6 +117,12 @@ static void jit_add_ht_entry(uint16_t gb_addr, uint16_t gb_bank, jit_fn fn)
     
     // add 2; 1 for new entry, 1 for terminal.
     jit_ht_entry* n = malloc(sizeof(jit_ht_entry) * (prev_size + 2));
+    
+    if (!n)
+    {
+        return;
+    }
+    
     memcpy(n, prev, sizeof(jit_ht_entry) * prev_size);
     
     // new entry
@@ -248,6 +256,20 @@ static int is_reghi(oparg reg)
     }
 }
 
+
+static int is_reglo(oparg reg)
+{
+    switch(reg)
+    {
+    case OPARG_C:
+    case OPARG_E:
+    case OPARG_L:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int is_reg8(oparg reg)
 {
     switch(reg)
@@ -265,6 +287,19 @@ static int is_reg8(oparg reg)
     }
 }
 
+static int is_reg16(oparg reg)
+{
+    switch(reg)
+    {
+    case OPARG_BC:
+    case OPARG_DE:
+    case OPARG_HL:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int reg_armidx(oparg reg)
 {
     switch(reg)
@@ -273,14 +308,18 @@ static int reg_armidx(oparg reg)
         return REG_A;
     case OPARG_B:
     case OPARG_C:
+    case OPARG_BC:
         return REG_BC;
     case OPARG_D:
     case OPARG_E:
+    case OPARG_DE:
         return REG_DE;
     case OPARG_H:
     case OPARG_L:
+    case OPARG_HL:
         return REG_HL;
     default:
+        assert(false);
         return 0;
     }
 }
@@ -550,9 +589,8 @@ static void dis_ld(oparg dst, oparg src)
                 else
                 {
                     // and r%dst, $ff00
-                    // TODO
                     unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    dis_instr16(
+                    dis_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
                         | (reg_armidx(dst) << 21)
@@ -569,11 +607,250 @@ static void dis_ld(oparg dst, oparg src)
                         | immediate
                     );
                 }
-                
-                
-                
-                
             }
+        }
+        else if (is_reg8(src))
+        {
+            if (src == dst) return;
+            else if (dst == OPARG_A)
+            {
+                if (is_reghi(src))
+                {
+                    // lsrs r%dst, r%src, 8
+                    dis_instr16(
+                        0x0A00
+                        | (reg_armidx(dst) << 0)
+                        | (reg_armidx(src) << 3)
+                    );
+                }
+                else
+                {
+                    // movs r%dst, r%src
+                    dis_instr16(
+                        0x0000
+                        | (reg_armidx(dst) << 0)
+                        | (reg_armidx(src) << 3)
+                    );
+                    
+                    // uxtb r%dst, r%dst
+                    dis_instr16(
+                        0xB2C0
+                        | (reg_armidx(dst) << 3)
+                        | (reg_armidx(dst) << 0)
+                    );
+                }
+            }
+            else if (src == OPARG_A)
+            {
+                if (is_reghi(dst))
+                {
+                    // uxtb r%dst, r%dst
+                    dis_instr16(
+                        0xB2C0
+                        | (reg_armidx(dst) << 3)
+                        | (reg_armidx(dst) << 0)
+                    );
+                    
+                    // orr r%dst, r%dst, r%src, lsl #8
+                    dis_instr32(
+                        0xEA402000
+                        | (reg_armidx(dst) << 16)
+                        | (reg_armidx(dst) << 8)
+                        | (reg_armidx(src) << 0)
+                    );
+                }
+                else
+                {
+                    // and r%dst, $ff00
+                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
+                    dis_instr32(
+                        0xf0000000
+                        | (bits(imm_encoding, 11, 1) << 26)
+                        | (reg_armidx(dst) << 21)
+                        | (bits(imm_encoding, 8, 3) << 12)
+                        | (reg_armidx(dst) << 8)
+                        | (bits(imm_encoding, 0, 8) << 0)
+                    );
+                    
+                    // orr r%dst, r%src
+                    dis_instr16(
+                        0x4300
+                        | (reg_armidx(dst) << 0)
+                        | (reg_armidx(src) << 3)
+                    );
+                }
+            }
+            else // neither operand is A
+            {
+                if (reg_armidx(dst) == reg_armidx(src))
+                {
+                    if (is_reghi(src))
+                    {
+                        // lsrs r, r, $8
+                        dis_instr16(
+                            0x0A00
+                            | (reg_armidx(dst) << 3)
+                            | (reg_armidx(dst) << 0)
+                        );
+                    }
+                    else
+                    {
+                        // uxtb r, r
+                        dis_instr16(
+                            0xB2C0
+                            | (reg_armidx(dst) << 3)
+                            | (reg_armidx(dst) << 0)
+                        );
+                    }
+                    
+                    // orr r, r, r, lsl #8
+                    dis_instr32(
+                        0xEA402000
+                        | (reg_armidx(dst) << 16)
+                        | (reg_armidx(dst) << 8)
+                        | (reg_armidx(src) << 0)
+                    );
+                }
+                else if (is_reghi(dst) && is_reghi(src))
+                {
+                    // uxtb r%dst, r%dst
+                    dis_instr16(
+                        0xB2C0
+                        | (reg_armidx(dst) << 3)
+                        | (reg_armidx(dst) << 0)
+                    );
+                    
+                    // push {r%src}
+                    dis_instr16((1 << reg_armidx(src)) | 0xb400);
+                    
+                    // and r%src, $ff00
+                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
+                    dis_instr32(
+                        0xf0000000
+                        | (bits(imm_encoding, 11, 1) << 26)
+                        | (reg_armidx(src) << 16)
+                        | (bits(imm_encoding, 8, 3) << 12)
+                        | (reg_armidx(src) << 8)
+                        | (bits(imm_encoding, 0, 8) << 0)
+                    );
+                    
+                    // orr r%dst, r%src
+                    dis_instr16(
+                        0x4300
+                        | (reg_armidx(dst) << 0)
+                        | (reg_armidx(src) << 3)
+                    );
+                    
+                    // pop {r%src}
+                    dis_instr16((1 << reg_armidx(src)) | 0xbc00);
+                }
+                else if (is_reglo(dst) && is_reglo(src))
+                {
+                    // and r%dst, $ff00
+                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
+                    dis_instr32(
+                        0xf0000000
+                        | (bits(imm_encoding, 11, 1) << 26)
+                        | (reg_armidx(dst) << 16)
+                        | (bits(imm_encoding, 8, 3) << 12)
+                        | (reg_armidx(dst) << 8)
+                        | (bits(imm_encoding, 0, 8) << 0)
+                    );
+                    
+                    // push {r%src}
+                    dis_instr16((1 << reg_armidx(src)) | 0xb400);
+                    
+                    // uxtb r%src, r%src
+                    dis_instr16(
+                        0xB2C0
+                        | (reg_armidx(src) << 3)
+                        | (reg_armidx(src) << 0)
+                    );
+                    
+                    // orr r%dst, r%src
+                    dis_instr16(
+                        0x4300
+                        | (reg_armidx(dst) << 0)
+                        | (reg_armidx(src) << 3)
+                    );
+                    
+                    // pop {r%src}
+                    dis_instr16((1 << reg_armidx(src)) | 0xbc00);
+                }
+                else if (is_reghi(dst) && !is_reghi(src))
+                {
+                    
+                    // uxtb r%dst, r%dst
+                    dis_instr16(
+                        0xB2C0
+                        | (reg_armidx(dst) << 3)
+                        | (reg_armidx(dst) << 0)
+                    );
+                    
+                    return;
+                    
+                    // orr r%dst, r%dst, r%src, lsl #8
+                    dis_instr32(
+                        0xEA402000
+                        | (reg_armidx(dst) << 16)
+                        | (reg_armidx(dst) << 8)
+                        | (reg_armidx(src) << 0)
+                    );
+                    
+                    // OPTIMIZE -- can skip this if we know src's hi is 0.
+                    // and r%dst, $ff00
+                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
+                    dis_instr32(
+                        0xf0000000
+                        | (bits(imm_encoding, 11, 1) << 26)
+                        | (reg_armidx(dst) << 16)
+                        | (bits(imm_encoding, 8, 3) << 12)
+                        | (reg_armidx(dst) << 8)
+                        | (bits(imm_encoding, 0, 8) << 0)
+                    );
+                }
+                else if (!is_reghi(dst) && is_reghi(src))
+                {
+                    // and r%dst, $ff00
+                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
+                    dis_instr32(
+                        0xf0000000
+                        | (bits(imm_encoding, 11, 1) << 26)
+                        | (reg_armidx(dst) << 21)
+                        | (bits(imm_encoding, 8, 3) << 12)
+                        | (reg_armidx(dst) << 8)
+                        | (bits(imm_encoding, 0, 8) << 0)
+                    );
+                    
+                    // orr r%dst, r%dst, r%src, lsr #8
+                    dis_instr32(
+                        0xEA502010
+                        | (reg_armidx(dst) << 16)
+                        | (reg_armidx(dst) << 8)
+                        | (reg_armidx(src) << 0)
+                    );
+                }
+            }
+        }
+        else
+        {
+            assert(false);
+        }
+    }
+    else if (is_reg16(dst))
+    {
+        if (src == OPARG_i16)
+        // e.g. ld bc, $1234
+        {
+            // movw r%dst, imm
+            dis_instr32(
+                0xF2400000
+                | (reg_armidx(dst) << 8)
+                | (bits(immediate, 0, 8) << 0)
+                | (bits(immediate, 8, 3) << 12)
+                | (bits(immediate, 11, 1) << 26)
+                | (bits(immediate, 12, 4) << 16)
+            );
         }
         else
         {
@@ -714,6 +991,11 @@ static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, 
     memset(&dis, 0, sizeof(dis));
     dis.armcap = 0x100;
     dis.arm = (armop*)malloc(dis.armcap * sizeof(armop));
+    if (!dis.arm)
+    {
+        dis.error = 1;
+        return;
+    }
     for (size_t i = 0; i < JIT_START_PADDING_ENTRY_C; ++i)
     {
         dis.arm[i].produce = disp_skip;
@@ -1227,6 +1509,10 @@ static void disassemble_padding(void)
     
     size_t padc = 0;
     
+    // we have to push r4-r7 if we use them -- they are callee-push registers.
+    uint32_t reg_push = used_registers() & ~0xf;
+    if (reg_push) prologue_16(0xb400 | reg_push);
+    
     if (dis.use_r_regfile)
     {
         JIT_DEBUG_MESSAGE("r1 <- regfile: %8x", (uintptr_t)(void*)opts.regs);
@@ -1266,8 +1552,8 @@ static void disassemble_padding(void)
     if (dis.init_r_bc)
     {
         prologue_16(
-            0x6800
-            | (offsetof_hi(jit_regfile_t, af) << 6)
+            0x8800
+            | (offsetof(jit_regfile_t, bc) << 6)
             | (REG_REGF << 3)
             | (REG_BC << 0)
         );
@@ -1276,8 +1562,8 @@ static void disassemble_padding(void)
     if (dis.init_r_de)
     {
         prologue_16(
-            0x6800
-            | (offsetof_hi(jit_regfile_t, af) << 6)
+            0x8800
+            | (offsetof(jit_regfile_t, de) << 6)
             | (REG_REGF << 3)
             | (REG_DE << 0)
         );
@@ -1286,8 +1572,8 @@ static void disassemble_padding(void)
     if (dis.init_r_hl)
     {
         prologue_16(
-            0x6800
-            | (offsetof_hi(jit_regfile_t, af) << 6)
+            0x8800
+            | (offsetof(jit_regfile_t, hl) << 6)
             | (REG_REGF << 3)
             | (REG_HL << 0)
         );
@@ -1307,9 +1593,10 @@ static void disassemble_padding(void)
     
     if (dis.dirty_r_bc)
     {
+        // strh r%bc, [r%regf, offsetof(jit_regfile, bc)]
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, bc) << 6)
+            | (offsetof(jit_regfile_t, bc) << 5)
             | (REG_REGF << 3)
             | (REG_BC << 0)
         );
@@ -1319,7 +1606,7 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, de) << 6)
+            | (offsetof(jit_regfile_t, de) << 5)
             | (REG_REGF << 3)
             | (REG_DE << 0)
         );
@@ -1329,11 +1616,13 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, hl) << 6)
+            | (offsetof(jit_regfile_t, hl) << 5)
             | (REG_REGF << 3)
             | (REG_HL << 0)
         );
     }
+    
+    if (reg_push) epilogue_16(0xbc00 | reg_push);
     
     // return.
     epilogue_16(0x4770);
@@ -1361,6 +1650,13 @@ static void* disassemble_end(void)
     
     // allocate output buffer
     uint16_t* const out = (uint16_t*)malloc(outsize * sizeof(uint16_t));
+    if (!out)
+    {
+        dis.error = 1;
+        if (dis.arm) free(dis.arm);
+        return NULL;
+    }
+    
     JIT_DEBUG_MESSAGE("base address: %8x", out);
     uint16_t* outb = out;
     

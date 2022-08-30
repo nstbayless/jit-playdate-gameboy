@@ -15,9 +15,20 @@ static const uint8_t gbrom_nop[] = {
 };
 
 static const uint8_t gbrom_ld[] = {
-	0x3E, 0x69,  // ld a, $69
-	0x06, 0x3A,  // ld b, $3A
-	0x10, 		// stop
+	0x3E, 0x69,  		// ld a, $69
+	0x06, 0x3A,  		// ld b, $3A
+	0x11, 0x34, 0x12,   // ld de, $1234
+	0x10, 				// stop
+};
+
+static const uint8_t gbrom_transfer[] = {
+	0x16, 0x20,  		// ld d, $20
+	0x5A,               // ld e, d
+	0x42,               // ld b, d
+	0x4B,               // ld c, e
+	0x61,               // ld h, c
+	0x68,               // ld l, b
+	0x10, 				// stop
 };
 
 static void test_stop(void)
@@ -145,6 +156,18 @@ int eventHandler
 		
 		#ifdef TARGET_PLAYDATE
 		playdate->system->logToConsole("register af: %4X", regs.af);
+		playdate->system->logToConsole("register bc: %4X", regs.bc);
+		playdate->system->logToConsole("register de: %4X", regs.de);
+		playdate->system->logToConsole("register hl: %4X", regs.hl);
+		#endif
+		
+		do_test(gbrom_transfer);
+		
+		#ifdef TARGET_PLAYDATE
+		playdate->system->logToConsole("register af: %4X", regs.af);
+		playdate->system->logToConsole("register bc: %4X", regs.bc);
+		playdate->system->logToConsole("register de: %4X", regs.de);
+		playdate->system->logToConsole("register hl: %4X", regs.hl);
 		#endif
 	}
 	return 0;
