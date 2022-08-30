@@ -8,7 +8,7 @@ typedef void (*jit_fn)(void);
 typedef struct
 {
     uint16_t af, bc, de, hl, sp, pc;
-} jit_regfile;
+} jit_regfile_t;
 
 typedef struct
 {
@@ -20,7 +20,7 @@ typedef struct
     void (*illegal)(void);
     uint8_t (*read)(uint16_t addr);
     void (*write)(uint16_t addr, uint8_t value);
-    jit_regfile* regs;
+    jit_regfile_t* regs;
     unsigned is_gb_color : 1;
     PlaydateAPI* playdate;
 } jit_opts;

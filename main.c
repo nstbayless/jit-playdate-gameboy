@@ -7,25 +7,26 @@ static PlaydateAPI* playdate;
 static uint8_t wram[0x800];
 static uint8_t hram[0x7F];
 
-static jit_regfile regs;
+static jit_regfile_t regs;
 static unsigned halt;
 
 static const uint8_t gbrom_nop[] = {
 	0x10, 	// stop
 };
 
-static const uint8_t gbrom_lda[] = {
-	0x3E, 0x69  // ld a, $69
+static const uint8_t gbrom_ld[] = {
+	0x3E, 0x69,  // ld a, $69
+	0x06, 0x3A,  // ld b, $3A
 	0x10, 		// stop
 };
 
-void test_stop(void)
+static void test_stop(void)
 {
 	halt = 1;
-	playdate->system->logToConsole("STOP\n");
+	//playdate->system->logToConsole("STOP\n");
 }
 
-void test_halt(void)
+static void test_halt(void)
 {
 	playdate->system->logToConsole("HALT\n");
 }
@@ -134,16 +135,16 @@ int eventHandler
 (PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 {
 	playdate = pd;
-	playdate->system->logToConsole("hello %d\n", event);
 	playdate->system->setUpdateCallback(update, NULL);
 	
 	if (event == kEventInit)
 	{
 		do_test(gbrom_nop);
 		
-		do_test(gbrom_lda);
+		do_test(gbrom_ld);
+		
 		#ifdef TARGET_PLAYDATE
-		playdate->system->logToConsole("call succeeded\n");
+		playdate->system->logToConsole("register af: %4X", regs.af);
 		#endif
 	}
 	return 0;
