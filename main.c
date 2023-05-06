@@ -4,7 +4,7 @@
 
 static volatile int b = 0;
 static PlaydateAPI* playdate;
-static uint8_t wram[0x800];
+static uint8_t wram[0x2000];
 static uint8_t hram[0x7F];
 
 static jit_regfile_t regs;
@@ -17,7 +17,7 @@ static const uint8_t gbrom_nop[] = {
 static const uint8_t gbrom_ld[] = {
 	0x3E, 0x69,  		// ld a, $69
 	0x06, 0x3A,  		// ld b, $3A
-	0x11, 0x34, 0x12,   // ld de, $1234
+	0x11, 0x34, 0x12,   // ld de, #$1234
 	0x10, 				// stop
 };
 
@@ -28,13 +28,23 @@ static const uint8_t gbrom_transfer[] = {
 	0x4B,               // ld c, e
 	0x61,               // ld h, c
 	0x68,               // ld l, b
+	0x1E, 0x33,  		// ld e, $33
+	0x53,               // ld d, e
+	0x10, 				// stop
+};
+
+static const uint8_t gbrom_memaccess[] = {
+	0x3E, 0x30,  		// ld a, $30
+	0xEA, 0x00, 0xC0,   // ld ($C000), a
+	0x3E, 0x10,  		// ld a, $10
+	0xFA, 0x00, 0xC0,   // ld a, ($C000)
 	0x10, 				// stop
 };
 
 static void test_stop(void)
 {
 	halt = 1;
-	//playdate->system->logToConsole("STOP\n");
+	playdate->system->logToConsole("STOP\n");
 }
 
 static void test_halt(void)
@@ -141,6 +151,20 @@ int update(void* A)
 	return 0;
 } 
 
+// This just serves to prove that a dummy function can be
+// executed from machine code directly.
+// try invoking this as a function with signature void(void).
+// It can also be invoked as an int(int), in which case it returns
+// the input.
+
+typedef void(*fn_t)(void);
+#ifdef TARGET_PLAYDATE
+const uint16_t _nop_data[] = {
+	0x4770 // bx lr
+};
+
+fn_t _nop = (fn_t)&_nop_data;
+#endif
 
 int eventHandler
 (PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
@@ -148,10 +172,24 @@ int eventHandler
 	playdate = pd;
 	playdate->system->setUpdateCallback(update, NULL);
 	
+	return 0;
+	
+	#ifdef TARGET_PLAYDATE
+	jit_invalidate_cache();
+	_nop();
+	#endif
+	//playdate->system->logToConsole("static nop: %d", _nop_ii(4));
+	return 0;
+	
 	if (event == kEventInit)
 	{
+		playdate->system->setAutoLockDisabled(0);
+		playdate->system->logToConsole("Nop:");
 		do_test(gbrom_nop);
 		
+		return 0;
+		
+		playdate->system->logToConsole("Ld:");
 		do_test(gbrom_ld);
 		
 		#ifdef TARGET_PLAYDATE
@@ -159,15 +197,38 @@ int eventHandler
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
+		jit_assert(regs.a == 0x69);
+		jit_assert(regs.bc == 0x003A);
+		jit_assert(regs.de == 0x1234);
 		#endif
 		
+		playdate->system->logToConsole("Transfer:");
 		do_test(gbrom_transfer);
-		
 		#ifdef TARGET_PLAYDATE
 		playdate->system->logToConsole("register af: %4X", regs.af);
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
+		
+		jit_assert(regs.a == 0x20);
+		jit_assert(regs.bc == 0x2020);
+		jit_assert(regs.de == 0x3333);
+		jit_assert(regs.hl == 0x2020);
+		#endif
+		
+		return 0;
+		
+		playdate->system->logToConsole("Mem Access:");
+		do_test(gbrom_memaccess);
+		#ifdef TARGET_PLAYDATE
+		playdate->system->logToConsole("register af: %4X", regs.af);
+		playdate->system->logToConsole("register bc: %4X", regs.bc);
+		playdate->system->logToConsole("register de: %4X", regs.de);
+		playdate->system->logToConsole("register hl: %4X", regs.hl);
+		
+		jit_assert(regs.af == 0x30);
+		jit_assert(wram[0] == 0x30);
+		jit_assert(1==2);
 		#endif
 	}
 	return 0;

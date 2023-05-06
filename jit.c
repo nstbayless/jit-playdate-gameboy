@@ -9,7 +9,7 @@
     #endif
     #define STM32F746xx
     #include "stm32f7xx.h" 
-    #define assert(...)
+    #define assert(_B) jit_assert_pd(_B, opts.playdate)
 #else
     #include <assert.h>
 #endif
@@ -36,14 +36,20 @@
 #endif
 
 // TODO: assign registers programatically
-#define REG_A 0
-#define REG_REGF 1
+// reg_flex MUST be reg 0, because r0 is the return register.
+#define REG_REGF 0
+#define REG_FLEX REG_REGF
+
+// these can be edited without loss of correctness.
+#define REG_A 2
 #define REG_BC 3
 #define REG_DE 4
-#define REG_HL 2
-#define REG_SP 5
+#define REG_HL 5
+#define REG_SP 6
 
 #define offsetof_hi(a, b) (offsetof(a, b) + 1)
+
+typedef void (*fn_type)(void);
 
 typedef struct
 {
@@ -232,6 +238,8 @@ static struct {
     unsigned init_r_sp : 1;
     unsigned dirty_r_sp : 1;
     unsigned use_r_regfile : 1;
+    unsigned use_r_flex : 1;
+    unsigned use_lr : 1;
 } dis;
 
 static uint8_t dis_read_rom_byte(void)
@@ -313,14 +321,17 @@ static int reg_armidx(oparg reg)
     case OPARG_B:
     case OPARG_C:
     case OPARG_BC:
+    case OPARG_BCm:
         return REG_BC;
     case OPARG_D:
     case OPARG_E:
     case OPARG_DE:
+    case OPARG_DEm:
         return REG_DE;
     case OPARG_H:
     case OPARG_L:
     case OPARG_HL:
+    case OPARG_HLm:
         return REG_HL;
     default:
         assert(false);
@@ -414,6 +425,7 @@ static uint32_t swap16_32(uint32_t a)
 #define WRITE_BUFF_INIT() uint16_t* const outbuff_base = outbuff;
 #define WRITE_BUFF_16(arg) do { if (outbuff_base) *(uint16_t*)(void*)outbuff=(arg); outbuff += 1; } while(0)
 #define WRITE_BUFF_32(arg) do { if (outbuff_base) *(uint32_t*)(void*)outbuff=swap16_32(arg); outbuff += 2; } while(0)
+#define FWD_BUFF() (outbuff_base ? outbuff : outbuff_base)
 #define WRITE_BUFF_END() ((uintptr_t)outbuff - (uintptr_t)outbuff_base) / sizeof(*outbuff)
 
 static uint8_t disp_skip(void* args, uint16_t* outbuff)
@@ -483,15 +495,9 @@ static uint8_t used_registers(void)
     return reg_push;
 }
 
-// call function directly.
-static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
+static uint8_t disp_bl(void* fn, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
-    
-    uint32_t reg_push = used_registers();
-    
-    // push {..., lr}
-    WRITE_BUFF_16(reg_push | 0xb500);
     
     // bl fn
     int32_t rel_addr = ((intptr_t)arm_interworking_none(fn) - (intptr_t)outbuff) / 2 - 2;
@@ -514,25 +520,46 @@ static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
         0xF000D000 | (urel_addr & 0x7ff) | ((urel_addr << 5) & 0x03ff0000) | j2 | j1 | sign
     );
     
+    return WRITE_BUFF_END();
+}
+
+// call function directly.
+static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
+{
+    WRITE_BUFF_INIT();
+    
+    // only need to save registers r0-r3
+    // registers r4+ are callee-saved
+    uint32_t reg_push = used_registers() & 0xF;
+    
+    // push {...}
+    WRITE_BUFF_16(reg_push | 0xb400);
+    
+    outbuff += disp_bl(fn, FWD_BUFF());
+    
     if (reg_push)
     {
         // pop {..., lr}
-        WRITE_BUFF_32(reg_push | 0xE8BD4000);
-    }
-    else
-    {
-        // pop {lr}
-        WRITE_BUFF_32(0xF85DEB04);
+        WRITE_BUFF_16(reg_push | 0xbc00);
     }
     
     return WRITE_BUFF_END();
 }
 
-static void dis_delegate(void (*fn)(void))
+static void dis_delegate(fn_type fn)
 {
+    dis.use_lr = 1;
     dis.arm[dis.armc++] = ARMOP(
         .args = (void*)fn,
         .produce = disp_delegate
+    );
+}
+
+static void dis_bl(fn_type fn)
+{
+    dis.arm[dis.armc++] = ARMOP(
+        .args = (void*)fn,
+        .produce = disp_bl
     );
 }
 
@@ -561,8 +588,45 @@ static unsigned thumbexpand_encoding(uint8_t value, unsigned ror)
     }
 }
 
+static void dis_inc(oparg arg)
+{
+    dis_clear_n();
+    // TODO
+}
+
+static void dis_dec(oparg arg)
+{
+    dis_set_n();
+    // TODO
+}
+
 static void dis_ld(oparg dst, oparg src)
 {
+    if (dst == OPARG_HLmi)
+    {
+        dis_ld(OPARG_HLm, src);
+        dis_inc(OPARG_HL);
+        return;
+    }
+    else if (dst == OPARG_HLmd)
+    {
+        dis_ld(OPARG_HLm, src);
+        dis_dec(OPARG_HL);
+        return;
+    }
+    else if (src == OPARG_HLmi)
+    {
+        dis_ld(dst, OPARG_HLm);
+        dis_inc(OPARG_HL);
+        return;
+    }
+    else if (src == OPARG_HLmd)
+    {
+        dis_ld(dst, OPARG_HLm);
+        dis_dec(OPARG_HL);
+        return;
+    }
+    
     use_register(src, 1, 0);
     use_register(dst, 0, 1);
     
@@ -578,6 +642,7 @@ static void dis_ld(oparg dst, oparg src)
             if (dst == OPARG_A)
             {
                 // movs r%a, imm
+                // cf. ARMv7-M Architecture Reference Manual A6-148, Encoding T1
                 dis_instr16(0x2000 | (immediate) | (reg_armidx(dst) << 8));
             }
             else
@@ -613,19 +678,22 @@ static void dis_ld(oparg dst, oparg src)
                     dis_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 21)
+                        | (reg_armidx(dst) << 16)
                         | (bits(imm_encoding, 8, 3) << 12)
                         | (reg_armidx(dst) << 8)
                         | (bits(imm_encoding, 0, 8) << 0)
                     );
                     
                     // orr  r%dst, imm
-                    dis_instr32(
-                        0xF0400000
-                        | (reg_armidx(dst) << 8)
-                        | (reg_armidx(dst) << 16)
-                        | immediate
-                    );
+                    if (immediate != 0)
+                    {
+                        dis_instr32(
+                            0xF0400000
+                            | (reg_armidx(dst) << 8)
+                            | (reg_armidx(dst) << 16)
+                            | immediate
+                        );
+                    }
                 }
             }
         }
@@ -686,7 +754,7 @@ static void dis_ld(oparg dst, oparg src)
                     dis_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 21)
+                        | (reg_armidx(dst) << 16)
                         | (bits(imm_encoding, 8, 3) << 12)
                         | (reg_armidx(dst) << 8)
                         | (bits(imm_encoding, 0, 8) << 0)
@@ -807,8 +875,6 @@ static void dis_ld(oparg dst, oparg src)
                         | (reg_armidx(dst) << 0)
                     );
                     
-                    return;
-                    
                     // orr r%dst, r%dst, r%src, lsl #8
                     dis_instr32(
                         0xEA402000
@@ -836,7 +902,7 @@ static void dis_ld(oparg dst, oparg src)
                     dis_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 21)
+                        | (reg_armidx(dst) << 16)
                         | (bits(imm_encoding, 8, 3) << 12)
                         | (reg_armidx(dst) << 8)
                         | (bits(imm_encoding, 0, 8) << 0)
@@ -856,6 +922,23 @@ static void dis_ld(oparg dst, oparg src)
         {
             assert(false);
         }
+    }
+    else if (src == OPARG_BCm || src == OPARG_DEm || src == OPARG_HLm)
+    {
+        dis.use_r_flex = 1;
+        
+        // push {...}
+        unsigned regs = used_registers() & 0xf & ~(1 << REG_FLEX);
+        if (regs) dis_instr16(regs | 0xb400);
+        
+        // movs r0, r%src
+        dis_instr16(0x0000 | (reg_armidx(src) << 3));
+        
+        // call read
+        dis_bl((fn_type)opts.read);
+        
+        // pop {...}
+        if (regs) dis_instr16(regs | 0xbc00);
     }
     else if (is_reg16(dst))
     {
@@ -881,18 +964,6 @@ static void dis_ld(oparg dst, oparg src)
     {
         assert(false);
     }
-}
-
-static void dis_inc(oparg arg)
-{
-    dis_clear_n();
-    // TODO
-}
-
-static void dis_dec(oparg arg)
-{
-    dis_set_n();
-    // TODO
 }
 
 static void dis_rotate(rotate_type rt, oparg dst)
@@ -1531,7 +1602,14 @@ static void disassemble_padding(void)
     
     // we have to push r4-r7 if we use them -- they are callee-push registers.
     uint32_t reg_push = used_registers() & ~0xf;
-    if (reg_push) prologue_16(0xb400 | reg_push);
+    if (reg_push && ! dis.use_lr)
+    {
+        prologue_16(0xb400 | reg_push);
+    }
+    else if (dis.use_lr)
+    {
+        prologue_16(0xb500 | reg_push);
+    }
     
     if (dis.use_r_regfile)
     {
@@ -1557,6 +1635,12 @@ static void disassemble_padding(void)
             | (bits(regf_addr, 28, 4) << 16)
             | (REG_REGF << 8)
         );
+        
+        if (dis.use_r_flex)
+        {
+            // regfile is flex register, so we must store this for later.
+            prologue_16(0xb400 | REG_FLEX);
+        }
     }
     
     if (dis.init_r_a)
@@ -1607,6 +1691,12 @@ static void disassemble_padding(void)
             | (REG_REGF << 3)
             | (REG_SP << 0)
         );
+    }
+    
+    if (dis.use_r_regfile && dis.use_r_flex)
+    {
+        // regfile is flex register, so we must retrieve it as it's been clobbered
+        epilogue_16(0xbc00 | REG_FLEX);
     }
     
     if (dis.dirty_r_a)
@@ -1662,7 +1752,16 @@ static void disassemble_padding(void)
         );
     }
     
-    if (reg_push) epilogue_16(0xbc00 | reg_push);
+    // pop {...}
+    if (reg_push && !dis.use_lr) epilogue_16(0xbc00 | reg_push);
+    else if (reg_push && dis.use_lr)
+    {
+        epilogue_32(reg_push | 0xE8BD4000);
+    }
+    else if (dis.use_lr)
+    {
+        epilogue_32(0xF85DEB04);
+    }
     
     // return.
     epilogue_16(0x4770);
@@ -1708,7 +1807,7 @@ static void* disassemble_end(void)
     free(dis.arm);
     
     #ifdef JIT_DEBUG
-    JIT_DEBUG_MESSAGE("bytecode: ");
+    JIT_DEBUG_MESSAGE("arm code: ");
     for (size_t i = 0; i < outsize; ++i)
     {
         opts.playdate->system->logToConsole("%04x ", out[i]);
@@ -1745,6 +1844,16 @@ static jit_fn jit_compile(uint16_t gb_addr, uint16_t gb_bank)
     return (jit_fn)arm_interworking_thumb(fn);
 }
 
+void jit_invalidate_cache()
+{
+    #if TARGET_PLADATE
+    SCB_InvalidateDCache();
+    SCB_InvalidateICache();
+    SCB_InvalidateDCache();
+    SCB_InvalidateICache();
+    #endif
+}
+
 jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank)
 {
     jit_fn f = get_jit_fn(gb_addr, gb_bank);
@@ -1753,12 +1862,7 @@ jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank)
     // no existing fn -- create one.
     jit_fn fn = jit_compile(gb_addr, gb_bank);
     if (!fn) return NULL;
-    #if TARGET_PLADATE
-    SCB_InvalidateDCache();
-    SCB_InvalidateICache();
-    SCB_InvalidateDCache();
-    SCB_InvalidateICache();
-    #endif
+    jit_invalidate_cache();
     return fn;
 }
 
