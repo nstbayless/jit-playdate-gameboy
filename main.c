@@ -1,4 +1,5 @@
 #include "pd_api.h"
+#include "pdnewlib.h"
 #include "jit.h"
 #include <stdint.h>
 
@@ -17,7 +18,7 @@ static const uint8_t gbrom_nop[] = {
 static const uint8_t gbrom_ld[] = {
 	0x3E, 0x69,  		// ld a, $69
 	0x06, 0x3A,  		// ld b, $3A
-	0x11, 0x34, 0x12,   // ld de, #$1234
+	0x11, 0x34, 0x12,   // ld de, $1234
 	0x10, 				// stop
 };
 
@@ -124,7 +125,6 @@ void do_test(const uint8_t* rom)
 			playdate->system->logToConsole("(invoking.)\n");
 			spin();
 			fn();
-			//((jit_fn)(func))();
 			playdate->system->logToConsole("Done.\n");
 			spin();
 			playdate->system->logToConsole("(Done.)\n");
@@ -157,29 +157,13 @@ int update(void* A)
 // It can also be invoked as an int(int), in which case it returns
 // the input.
 
-typedef void(*fn_t)(void);
-#ifdef TARGET_PLAYDATE
-const uint16_t _nop_data[] = {
-	0x4770 // bx lr
-};
-
-fn_t _nop = (fn_t)&_nop_data;
-#endif
 
 int eventHandler
 (PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 {
+	eventHandler_pdnewlib(playdate, event, arg);
 	playdate = pd;
 	playdate->system->setUpdateCallback(update, NULL);
-	
-	return 0;
-	
-	#ifdef TARGET_PLAYDATE
-	jit_invalidate_cache();
-	_nop();
-	#endif
-	//playdate->system->logToConsole("static nop: %d", _nop_ii(4));
-	return 0;
 	
 	if (event == kEventInit)
 	{
@@ -187,7 +171,6 @@ int eventHandler
 		playdate->system->logToConsole("Nop:");
 		do_test(gbrom_nop);
 		
-		return 0;
 		
 		playdate->system->logToConsole("Ld:");
 		do_test(gbrom_ld);
@@ -201,6 +184,8 @@ int eventHandler
 		jit_assert(regs.bc == 0x003A);
 		jit_assert(regs.de == 0x1234);
 		#endif
+		
+		return 0;
 		
 		playdate->system->logToConsole("Transfer:");
 		do_test(gbrom_transfer);

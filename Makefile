@@ -24,13 +24,13 @@ endif
 VPATH +=
 
 # List C source files here
-SRC += main.c jit.c
+SRC += main.c jit.c armd.c pdnewlib.c
 
 # List all user directories here
 UINCDIR += $(VPATH) ./STM32CubeF7/Drivers/CMSIS/Include ./STM32CubeF7/Drivers/CMSIS/Device/ST/STM32F7xx/Include
 
 # List all user C define here, like -D_DEBUG=1
-UDEFS +=
+UDEFS += -DJIT_DEBUG
 
 # Define ASM defines here
 UADEFS +=

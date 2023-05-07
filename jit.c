@@ -1,7 +1,9 @@
 #include "jit.h"
+#include "armd.h"
 
-#define JIT_DEBUG
-
+#ifndef JIT_DEBUG
+    #define JIT_DEBUG
+#endif
 
 #ifdef TARGET_PLAYDATE
     #ifdef __FPU_USED
@@ -41,11 +43,12 @@
 #define REG_FLEX REG_REGF
 
 // these can be edited without loss of correctness.
-#define REG_A 2
+// keep in mind that 5+ are caller-saved
+#define REG_A 1
 #define REG_BC 3
 #define REG_DE 4
-#define REG_HL 5
-#define REG_SP 6
+#define REG_HL 2
+#define REG_SP 5
 
 #define offsetof_hi(a, b) (offsetof(a, b) + 1)
 
@@ -208,6 +211,8 @@ typedef struct {
     // if `outbuff` is NULL, don't actually write anything.
     // return size of (what would be) written
     uint8_t (*produce)(void* args, uint16_t* outbuff);
+    
+    const char* (*describe)(void* args);
 } armop;
 
 // disassembly state.
@@ -533,13 +538,16 @@ static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
     uint32_t reg_push = used_registers() & 0xF;
     
     // push {...}
-    WRITE_BUFF_16(reg_push | 0xb400);
+    if (reg_push)
+    {
+        WRITE_BUFF_16(reg_push | 0xb400);
+    }
     
     outbuff += disp_bl(fn, FWD_BUFF());
     
     if (reg_push)
     {
-        // pop {..., lr}
+        // pop {...}
         WRITE_BUFF_16(reg_push | 0xbc00);
     }
     
@@ -1091,6 +1099,7 @@ static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, 
     {
         dis.arm[i].produce = disp_skip;
     }
+    dis.use_r_a = 1;
     dis.armc = JIT_START_PADDING_ENTRY_C;
     dis.rom = (const uint8_t*)opts.rom + gb_rom_offset;
     dis.romend = (const uint8_t*)opts.rom + gb_end_offset;
@@ -1753,7 +1762,10 @@ static void disassemble_padding(void)
     }
     
     // pop {...}
-    if (reg_push && !dis.use_lr) epilogue_16(0xbc00 | reg_push);
+    if (reg_push && !dis.use_lr)
+    {
+        epilogue_16(0xbc00 | reg_push);
+    }
     else if (reg_push && dis.use_lr)
     {
         epilogue_32(reg_push | 0xE8BD4000);
@@ -1808,9 +1820,23 @@ static void* disassemble_end(void)
     
     #ifdef JIT_DEBUG
     JIT_DEBUG_MESSAGE("arm code: ");
-    for (size_t i = 0; i < outsize; ++i)
+    const char* outmsg;
+    for (const uint16_t* arm = out; arm && arm != out+outsize;)
     {
-        opts.playdate->system->logToConsole("%04x ", out[i]);
+        const uint16_t* armprev = arm;
+        arm = armd(arm, &outmsg);
+        if (arm && arm == armprev+1)
+        {
+            opts.playdate->system->logToConsole("%04x ; %s", *armprev, outmsg);
+        }
+        else if (arm && arm == armprev+2)
+        {
+            opts.playdate->system->logToConsole("%04x%04x ; %s", armprev[0], armprev[1], outmsg);
+        }
+        else
+        {
+            opts.playdate->system->logToConsole("DISASM ERROR");
+        }
     }
     JIT_DEBUG_MESSAGE(" Done.\n");
     spin(); spin(); spin();
