@@ -35,6 +35,18 @@ static int decode_16(const uint16_t arm, uintptr_t base);
 #define BITMATCH(a, ...) \
     ((a & (FOLD(BITSHIFT_MASK, 0, __VA_ARGS__))) \
     == FOLD(BITSHIFT_VALUE, 0, __VA_ARGS__))
+    
+#ifdef TARGET_PLAYDATE
+    #define PRIxPTR "%lx"
+#else
+    #define PRIxPTR "%x"
+#endif
+
+#ifdef TARGET_PLAYDATE
+    #define PRIx32 "%lx"
+#else
+    #define PRIx32 "%x"
+#endif
 
 #define ptr_to_uint(x) ((uintptr_t)(void*)x)
 #define TODO " [TODO]"
@@ -125,10 +137,10 @@ static uint32_t bit(uint32_t src, uint32_t idx)
 
 #define IMM5_RD_RM(u) bits(u, 6, 5), bits(u, 0, 4), bits(u, 4, 4)
 
-const char* tmpxint(unsigned int i)
+const char* tmpxint(uint32_t i)
 {
     char* buff = getbuff();
-    snprintf(buff, IMMAX, "#$%x", i);
+    snprintf(buff, IMMAX, "#$" PRIx32, i);
     return buff;
 }
 
@@ -178,15 +190,22 @@ const char* expand_imm12(uint16_t imm12, int c)
     }
     else
     {
-        unsigned int unrot = bits(imm12, 0, 7);
-        unsigned int rot = bits(imm12, 7, 4);
-        if (c)
+        unsigned int unrot = bits(imm12, 0, 7) | 0x80;
+        unsigned int rot = bits(imm12, 7, 5);
+        
+        uint32_t result = (unrot >> rot) | (unrot << (32-rot));
+        int carry = !! (result & 0x80000000);
+        if (rot == 0)
         {
-            snprintf(buff, IMMAX, "#RORC(%02x, %01x)->C", unrot, rot);
+            snprintf(buff, IMMAX, "#$??");
+        }
+        else if (c)
+        {
+            snprintf(buff, IMMAX, "#$" PRIx32 "; C <- %d", result, carry);
         }
         else
         {
-            snprintf(buff, IMMAX, "#RORC(%02x, %01x)", unrot, rot);
+            snprintf(buff, IMMAX, "#$" PRIx32, result);
         }
     }
     
@@ -278,7 +297,7 @@ static int decode_op32_s20_rn8_rd16_imm12_0_12_26(const char* name, uint32_t arm
     const char* imm = NULL;
     if (flags & EXPAND12)
     {
-        imm = expand_imm12(imm12, flags & EXPAND12C);
+        imm = expand_imm12(imm12, setflags && (flags & EXPAND12C));
     }
     else
     {
@@ -700,7 +719,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             
             uintptr_t absaddr = offset + base;
             
-            return prop("BL %zx", absaddr);
+            return prop("BL " PRIxPTR, absaddr);
         }
     }
     else if (BITMATCH(opcode, 1, 1,   0, 0, 0, x,  x, x, 0,   x))
@@ -1046,6 +1065,7 @@ static int decode_bx_16(const uint16_t arm, uintptr_t base)
 
 static int decode_16_single_data_item(const uint16_t arm, uintptr_t base)
 {
+    // A5-9
     uint8_t op = bits(arm, 9, 7);
     switch (op)
     {
@@ -1083,12 +1103,11 @@ static int decode_16_single_data_item(const uint16_t arm, uintptr_t base)
     case 0b01100:
         // A6-222 STR (immediate)
         {
-            uint8_t rm = bits(arm, 6, 3);
-            return prop("STR %s, [%s, %s]", rname(rt), rname(rn), rname (rm));
+            return prop("STR %s, [%s,%02x]", rname(rt), rname(rn), imm5<<2);
         }
     case 0b01101:
         // A6-88 LDR (immediate)
-        return prop("LDR %s, [%s,%02x]", rname(rt), rname(rn), imm5);
+        return prop("LDR %s, [%s,%02x]", rname(rt), rname(rn), imm5 << 2);
     case 0b01110:
         // A6-226 STRB (immediate)
         return prop("STRB %s, [%s,%02x]", rname(rt), rname(rn), imm5);
@@ -1097,10 +1116,10 @@ static int decode_16_single_data_item(const uint16_t arm, uintptr_t base)
         return prop("LDRB %s, [%s,%02x]", rname(rt), rname(rn), imm5);
     case 0b10000:
         // A6-238 STRH (immediate)
-        return prop("STRH %s, [%s,%02x]", rname(rt), rname(rn), imm5);
+        return prop("STRH %s, [%s,%02x]", rname(rt), rname(rn), imm5 << 1);
     case 0b10001:
         // A6-110 LDRH (immediate)
-        return prop("LDRH %s, [%s,%02x]", rname(rt), rname(rn), imm5);
+        return prop("LDRH %s, [%s,%02x]", rname(rt), rname(rn), imm5 << 1);
     case 0b10010:
         // A6-222 STR (immediate) T2
         return prop("STR %s, [SP,%02x]", rname(bits(arm, 8, 3)), bits(arm, 0, 8) << 2);

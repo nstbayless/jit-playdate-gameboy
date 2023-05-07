@@ -176,12 +176,12 @@ int eventHandler
 		do_test(gbrom_ld);
 		
 		#ifdef TARGET_PLAYDATE
-		playdate->system->logToConsole("register af: %4X", regs.af);
+		playdate->system->logToConsole("register a: %4X", regs.a);
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
 		jit_assert(regs.a == 0x69);
-		jit_assert(regs.bc == 0x003A);
+		jit_assert(regs.bc == 0x3A00);
 		jit_assert(regs.de == 0x1234);
 		#endif
 		
@@ -190,7 +190,7 @@ int eventHandler
 		playdate->system->logToConsole("Transfer:");
 		do_test(gbrom_transfer);
 		#ifdef TARGET_PLAYDATE
-		playdate->system->logToConsole("register af: %4X", regs.af);
+		playdate->system->logToConsole("register a: %4X", regs.a);
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
@@ -206,12 +206,12 @@ int eventHandler
 		playdate->system->logToConsole("Mem Access:");
 		do_test(gbrom_memaccess);
 		#ifdef TARGET_PLAYDATE
-		playdate->system->logToConsole("register af: %4X", regs.af);
+		playdate->system->logToConsole("register a: %4X", regs.a);
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
 		
-		jit_assert(regs.af == 0x30);
+		jit_assert(regs.a == 0x30);
 		jit_assert(wram[0] == 0x30);
 		jit_assert(1==2);
 		#endif

@@ -44,6 +44,7 @@
 
 // these can be edited without loss of correctness.
 // keep in mind that 5+ are caller-saved
+// these are the arm registers used to store the given z80 registers
 #define REG_A 1
 #define REG_BC 3
 #define REG_DE 4
@@ -212,7 +213,10 @@ typedef struct {
     // return size of (what would be) written
     uint8_t (*produce)(void* args, uint16_t* outbuff);
     
-    const char* (*describe)(void* args);
+    #ifdef JIT_DEBUG
+    const uint8_t* romsrc;
+    uint8_t length; // this is set from produce() and recorded for debugging purposes
+    #endif
 } armop;
 
 // disassembly state.
@@ -452,7 +456,11 @@ static uint8_t disp_32(void* args, uint16_t* outbuff)
     return WRITE_BUFF_END();
 }
 
-#define ARMOP(...) ({armop op = {__VA_ARGS__}; op;})
+#ifdef JIT_DEBUG
+    #define ARMOP(...) ({armop op = {__VA_ARGS__}; op.romsrc = NULL; op.length = 0; op;})
+#else
+        #define ARMOP(...) ({armop op = {__VA_ARGS__}; op;})
+#endif
 
 static void dis_instr16(uint16_t instr)
 {
@@ -500,6 +508,33 @@ static uint8_t used_registers(void)
     return reg_push;
 }
 
+static uint8_t dirty_registers(void)
+{
+    uint32_t reg_push = 0;
+    if (dis.dirty_r_a)
+    {
+        reg_push |= 1 << REG_A;
+    }
+    if (dis.dirty_r_bc)
+    {
+        reg_push |= 1 << REG_BC;
+    }
+    if (dis.dirty_r_de)
+    {
+        reg_push |= 1 << REG_DE;
+    }
+    if (dis.dirty_r_hl)
+    {
+        reg_push |= 1 << REG_HL;
+    }
+    if (dis.dirty_r_sp)
+    {
+        reg_push |= 1 << REG_SP;
+    }
+    reg_push |= 1 << REG_REGF;
+    return reg_push;
+}
+
 static uint8_t disp_bl(void* fn, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
@@ -516,7 +551,7 @@ static uint8_t disp_bl(void* fn, uint16_t* outbuff)
     uint32_t j1 = (!(urel_addr & (1 << 21)) == !sign)
         ? 0x2000
         : 0x0000;
-        
+    
     JIT_DEBUG_MESSAGE("callsite address: %8x", outbuff);
     JIT_DEBUG_MESSAGE("function address: %8x", fn);
     JIT_DEBUG_MESSAGE("relative addr: %8x; sign %x, j2 %x, j1 %x\n", urel_addr, sign, j2, j1);
@@ -657,14 +692,14 @@ static void dis_ld(oparg dst, oparg src)
             {
                 if (is_reghi(dst))
                 {
-                    // uxtb r%dst, r%dst
+                    // [A6.7.149] uxtb r%dst, r%dst
                     dis_instr16(
                         0xB2C0
                         | (reg_armidx(dst) << 3)
                         | (reg_armidx(dst) << 0)
                     );
                     
-                    // orr  r%dst, imm<<8
+                    // [A6.7.90] orr  r%dst, r%dst, imm<<8
                     if (immediate != 0)
                     {
                         unsigned imm_encoding = thumbexpand_encoding(immediate, 24);
@@ -1097,7 +1132,9 @@ static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, 
     }
     for (size_t i = 0; i < JIT_START_PADDING_ENTRY_C; ++i)
     {
-        dis.arm[i].produce = disp_skip;
+        dis.arm[i] = ARMOP(
+            .produce = disp_skip
+        );
     }
     dis.use_r_a = 1;
     dis.armc = JIT_START_PADDING_ENTRY_C;
@@ -1600,7 +1637,7 @@ static void disassemble_padding(void)
     // epilogue_x: adds code to end of block.
     // prologue_x: adds code to start of block.
     
-    // prologue size cannot exceed JIT_START_PADDING_C
+    // prologue size cannot exceed JIT_START_PADDING_ENTRY_C
     
     #define epilogue_16(x) dis_instr16(x)
     #define epilogue_32(x) dis_instr32(x)
@@ -1656,7 +1693,7 @@ static void disassemble_padding(void)
     {
         prologue_16(
             0x6800
-            | (offsetof_hi(jit_regfile_t, af) << 6)
+            | (offsetof(jit_regfile_t, a) << 6)
             | (REG_REGF << 3)
             | (REG_A << 0)
         );
@@ -1714,7 +1751,7 @@ static void disassemble_padding(void)
         // strb r%a, [r%regf, offsetof(jit_regfile, a)]
         epilogue_16(
             0x7000
-            | (offsetof_hi(jit_regfile_t, af) << 6)
+            | (offsetof(jit_regfile_t, a) << 6)
             | (REG_REGF << 3)
             | (REG_A << 0)
         );
@@ -1725,7 +1762,7 @@ static void disassemble_padding(void)
         // strh r%bc, [r%regf, offsetof(jit_regfile, bc)]
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, bc) << 6)
+            | ((offsetof(jit_regfile_t, bc)/2) << 6)
             | (REG_REGF << 3)
             | (REG_BC << 0)
         );
@@ -1735,7 +1772,7 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, de) << 6)
+            | ((offsetof(jit_regfile_t, de)/2) << 6)
             | (REG_REGF << 3)
             | (REG_DE << 0)
         );
@@ -1745,7 +1782,7 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, hl) << 6)
+            | ((offsetof(jit_regfile_t, hl)/2) << 6)
             | (REG_REGF << 3)
             | (REG_HL << 0)
         );
@@ -1755,7 +1792,7 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, sp) << 6)
+            | ((offsetof(jit_regfile_t, sp)/2) << 6)
             | (REG_REGF << 3)
             | (REG_SP << 0)
         );
@@ -1796,7 +1833,11 @@ static void* disassemble_end(void)
     size_t outsize = 0;
     for (size_t i = 0; i < dis.armc; ++i)
     {
-        outsize += dis.arm[i].produce(dis.arm[i].args, NULL);
+        uint8_t size = dis.arm[i].produce(dis.arm[i].args, NULL);
+        #ifdef JIT_DEBUG
+        dis.arm[i].length = size;
+        #endif
+        outsize += size;
     }
     
     // allocate output buffer
@@ -1816,22 +1857,37 @@ static void* disassemble_end(void)
         outb += dis.arm[i].produce(dis.arm[i].args, outb);
     }
     
-    free(dis.arm);
-    
     #ifdef JIT_DEBUG
+    #define printf opts.playdate->system->logToConsole
     JIT_DEBUG_MESSAGE("arm code: ");
     const char* outmsg;
-    for (const uint16_t* arm = out; arm && arm != out+outsize;)
+    size_t armi = 0;
+    size_t armseek = 0;
+    printf("Used: %02x; Dirty: %02x", used_registers(), dirty_registers());
+    for (const uint16_t* arm = out; arm && arm < out+outsize;)
     {
+        // zip along with arm disp as well
+        while (armseek < arm - out || (dis.arm[armi].length == 0 && armseek < outsize))
+        {
+            armseek += dis.arm[armi++].length;
+        }
+        
+        if (armseek == arm - out)
+        {
+            if (dis.arm[armi].romsrc)
+            {
+                printf("; z80: %02X", *dis.arm[armi].romsrc);
+            }
+        }
         const uint16_t* armprev = arm;
         arm = armd(arm, &outmsg);
         if (arm && arm == armprev+1)
         {
-            opts.playdate->system->logToConsole("%04x ; %s", *armprev, outmsg);
+            printf("%04x ; %s", *armprev, outmsg);
         }
         else if (arm && arm == armprev+2)
         {
-            opts.playdate->system->logToConsole("%04x%04x ; %s", armprev[0], armprev[1], outmsg);
+            printf("%04x%04x ; %s", armprev[0], armprev[1], outmsg);
         }
         else
         {
@@ -1841,6 +1897,8 @@ static void* disassemble_end(void)
     JIT_DEBUG_MESSAGE(" Done.\n");
     spin(); spin(); spin();
     #endif
+    
+    free(dis.arm);
     
     return arm_interworking_thumb(out);
 }
@@ -1859,7 +1917,19 @@ static jit_fn jit_compile(uint16_t gb_addr, uint16_t gb_bank)
     while (!disassemble_done())
     // disassemble each gameboy instruction one at a time.
     {
+        #ifdef JIT_DEBUG
+        size_t armi_prev = dis.armc;
+        const uint8_t* romsrc = dis.rom;
+        #endif
+        
         disassemble_instruction();
+        
+        #ifdef JIT_DEBUG
+        if (dis.armc > armi_prev)
+        {
+            dis.arm[armi_prev].romsrc = romsrc;
+        }
+        #endif
     }
     
     jit_fn fn = (jit_fn)disassemble_end();

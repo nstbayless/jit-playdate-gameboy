@@ -7,18 +7,13 @@ typedef void (*jit_fn)(void);
 
 typedef struct
 {
-    union
-    {
-        struct
-        {
-            uint8_t f, a, c, b, e, d, l, h;
-        };
-        
-        struct
-        {
-            uint16_t af, bc, de, hl, sp, pc;
-        };
-    };
+    // we store as 32-bit instead of 16 for better alignment properties.
+    uint16_t pc;
+    uint16_t a;
+    uint16_t hl;
+    uint16_t bc;
+    uint16_t de;
+    uint16_t sp;
 } jit_regfile_t;
 
 typedef struct
