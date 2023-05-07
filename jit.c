@@ -1711,7 +1711,7 @@ static void disassemble_padding(void)
     if (dis.dirty_r_a)
     {
         // write value of A back to regfile
-        // str r%a, [r%regf, offsetof(jit_regfile, a)]
+        // strb r%a, [r%regf, offsetof(jit_regfile, a)]
         epilogue_16(
             0x7000
             | (offsetof_hi(jit_regfile_t, af) << 6)
@@ -1725,7 +1725,7 @@ static void disassemble_padding(void)
         // strh r%bc, [r%regf, offsetof(jit_regfile, bc)]
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, bc) << 5)
+            | (offsetof(jit_regfile_t, bc) << 6)
             | (REG_REGF << 3)
             | (REG_BC << 0)
         );
@@ -1735,7 +1735,7 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, de) << 5)
+            | (offsetof(jit_regfile_t, de) << 6)
             | (REG_REGF << 3)
             | (REG_DE << 0)
         );
@@ -1745,7 +1745,7 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, hl) << 5)
+            | (offsetof(jit_regfile_t, hl) << 6)
             | (REG_REGF << 3)
             | (REG_HL << 0)
         );
@@ -1755,7 +1755,7 @@ static void disassemble_padding(void)
     {
         epilogue_16(
             0x8000
-            | (offsetof(jit_regfile_t, sp) << 5)
+            | (offsetof(jit_regfile_t, sp) << 6)
             | (REG_REGF << 3)
             | (REG_SP << 0)
         );
