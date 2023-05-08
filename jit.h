@@ -8,12 +8,12 @@ typedef void (*jit_fn)(void);
 typedef struct
 {
     // we store as 32-bit instead of 16 for better alignment properties.
-    uint16_t pc;
-    uint16_t a;
-    uint16_t hl;
-    uint16_t bc;
-    uint16_t de;
-    uint16_t sp;
+    uint32_t a;
+    uint32_t hl;
+    uint32_t bc;
+    uint32_t de;
+    uint32_t sp;
+    uint32_t pc;
 } jit_regfile_t;
 
 typedef struct

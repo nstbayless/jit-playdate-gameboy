@@ -130,6 +130,7 @@ static uint32_t bit(uint32_t src, uint32_t idx)
 
 #define REGS16 "{ %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s }"
 #define REGS9 "{ %s%s%s%s%s%s%s%s%s }"
+#define REGS8 "{ %s%s%s%s%s%s%s%s }"
 #define OPREGSEP(i, v) ((v) ? regnames_comma[i] : "")
 #define OPREGSEPM(i) OPREGSEP(i, (regs >> i) & 1)
 #define OPREGSEP8 MAP_LIST(OPREGSEPM, 0, 1, 2, 3, 4, 5, 6, 7)
@@ -422,10 +423,10 @@ static int decode_32(const uint32_t arm, uintptr_t base)
     {
         // A5-26 data processing (shifted register)
         // all operands are (reg)
-        int s = !!(arm & 0x21);
-        uint8_t op = (arm >> 22) & 0xF;
-        uint8_t rd = (arm >> 8) & 0xF;
-        uint8_t rn = (arm >> 16) & 0xF;
+        int s = bit(arm, 20);
+        uint8_t op = bits(arm, 21, 4);
+        uint8_t rd = bits(arm, 8, 4);
+        uint8_t rn = bits(arm, 16, 4);
         
         switch(op)
         {
@@ -440,7 +441,10 @@ static int decode_32(const uint32_t arm, uintptr_t base)
                 // A6-34 AND (reg)
                 return decode_op32_rd_rn_rmshift("AND", arm);
             }
-            break;
+            else
+            {
+                return prop("ERR [A5-26]");
+            }
         case 0b0001:
             // A6-46 BIC
             return prop(TODO "[A6-46]");
@@ -532,6 +536,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             // A6-206 SBC
             return prop(TODO "[A6-206]");
         }
+        return prop(TODO "[A5-26]");
     }
     else if (BITMATCH(opcode, 0, 1,   1, x, x, x,  x, x, x,   x))
     {
@@ -1133,6 +1138,7 @@ static int decode_16_single_data_item(const uint16_t arm, uintptr_t base)
 
 static int decode_16(const uint16_t arm, uintptr_t base)
 {
+    uint8_t regs, rn;
     const uint16_t opcode = (arm >> 10);
     if (BITMATCH(opcode, 0, 0, x, x, x, x))
     {
@@ -1206,11 +1212,15 @@ static int decode_16(const uint16_t arm, uintptr_t base)
         case 0b110000:
         case 0b110001:
             // A6-218 store multiple registers
-            break;
+            regs = bits(arm, 0, 8);
+            rn = bits(arm, 8, 3);
+            return prop("STM %s, " REGS8, rname(rn), OPREGSEP8);
         case 0b110010:
         case 0b110011:
             // A6-84 load multiple registers
-            break;
+            regs = bits(arm, 0, 8);
+            rn = bits(arm, 8, 3);
+            return prop("LDM %s, " REGS8, rname(rn), OPREGSEP8);
         case 0b110100:
         case 0b110101:
         case 0b110110:

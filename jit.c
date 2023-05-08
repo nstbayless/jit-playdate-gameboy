@@ -1,6 +1,59 @@
 #include "jit.h"
 #include "armd.h"
 
+/*
+    Useful resources when developing this JIT:
+    - Arm v7-m architecture reference manual: 
+        - https://developer.arm.com/documentation/ddi0489/b/
+        - This will help convert between arm opcodes and hexadecimal.
+    - ARM-to-hex:
+        - https://armconverter.com/ (thumb output)
+        - note that the byte-order is weird... it's like 2-3-0-1-ordered in significance.
+    - Arm Cortex M-7 reference manual (could be useful for cycle counting and I/O registers?)
+    - ARM assembler:
+        - https://onecompiler.com/assembly/3z7z43ypn
+*/
+
+/*
+    How this dynarec/JIT works:
+        - converts a short sequence of sm83 (gameboy) machine code to a callable subroutine of thumb (arm cortex m-7) machine code.
+            - we call this subroutine the "resultant chunk," or just chunk.
+        - each sm83 instruction can be multiple ARM instructions.
+        - only sm83 instructions from ROM are translated; if the gameboy's program counter is in ram or somewhere else exotic, the dynarec is skipped.
+        - additionally, some arm instructions are added to the start and end ("prologue" and "epilogue") of the chunk to interface with emulator (loading/storing registers, etc.).
+        - arm registers obey these invariants, which are assumed at the start and end of each transpiled sm83 instruction:
+            - r1 = A  (high 3 bytes are always 0)
+            - r2 = HL ()
+            - r3 = BC
+            - r4 = DE
+            - r5 = SP
+            - (r0 = pointer to jit_regfile_t, also used as flex/scratch, and to return cycle count at the end...it's still a bit vague and WIP.)
+            - (note that some registers may not be loaded in the prologue if they are not inputs for this chunk)
+            - (similarly, some registers may not be written in the epilogue if they are not modified this chunk)
+        - dynamic recompiling is done by translating in the following passes:
+            1. Fragmentation: each sm83 instruction is converted into multiple "translation fragments," or just "fragments" for short (frag_t).
+                - a fragment (frag_t) is a representation of an arm operation.
+                - for example, it could represent a single 16-bit thumb instruction, or it could be "call a function at a particular address" (which takes several instructions)
+                - some fragments are added at the start and end as prologue/epilogue.
+                - during this step, we keep track of what arm registers are "used," "input," and "dirty" (aka "output").
+                    - "used": the arm register was either 
+                    - "input": the arm register is read before it is written to; it must be loaded in the prologue.
+                    - "dirty": the arm register is modified and needs to be stored to jit_regfile_t in the epilogue.
+                        - we only care about storing dirty registers if they correspond to a sm83 register
+                        - the sm83 pc is assumed to always end up dirty, so we just store it in the epilogue (statically calculated).
+            2. Length: each fragment is then polled to get (an upper bound of) how long it is in terms of half-words (16-bits, i.e. thumb instruction alignment).
+            3. Assembly: each fragment is then assembled to a sequence of thumb instructions into a buffer of length equaling the sum of the fragment lengths.
+                - This buffer can now be called like any C function. It returns (in r0) the number of cycles that have passed.
+        - We can summarize the transformation of data then as: byte sm83[] -> frag_t fragments[] (including prologue/epilogue) -> byte thumb[].
+        - the cycle count is estimated by summing the cycle count for each fragment (at time of dynamic recompilation), and returning this value in r0.
+        - not implemented yet:
+            - r0 cycle count return
+            - storing pc.
+            - branching.
+            - status flags
+                
+*/
+
 #ifndef JIT_DEBUG
     #define JIT_DEBUG
 #endif
@@ -42,14 +95,17 @@
 #define REG_REGF 0
 #define REG_FLEX REG_REGF
 
-// these can be edited without loss of correctness.
-// keep in mind that 5+ are caller-saved
-// these are the arm registers used to store the given z80 registers
-#define REG_A 1
-#define REG_BC 3
-#define REG_DE 4
-#define REG_HL 2
-#define REG_SP 5
+// keep in mind that 4+ are caller-saved
+// these are the arm registers used to store the given sm83 registers
+// the are in the same order as the fields in jit_regfile_t to improve the behaviour of
+// stm/ldm instructions.
+#define REG_IDX(FIELD) (1 + offsetof(jit_regfile_t, FIELD) / sizeof(uint32_t))
+
+#define REG_A REG_IDX(a)
+#define REG_BC REG_IDX(bc)
+#define REG_DE REG_IDX(de)
+#define REG_HL REG_IDX(hl)
+#define REG_SP REG_IDX(sp)
 
 #define offsetof_hi(a, b) (offsetof(a, b) + 1)
 
@@ -62,6 +118,7 @@ typedef struct
     jit_fn fn;
 } jit_ht_entry;
 
+// all possible sm83 instruction operands and condition codes
 // suffix: m = memory (dereference)
 //         mi = dereference increment
 //         md = dereference decrement
@@ -75,7 +132,7 @@ typedef enum
     OPARG_i8m, OPARG_i16m,
     COND_none, COND_z, COND_c, COND_nz, COND_nc,
     ADDR_r8, ADDR_d16, ADDR_HL // relative 8; direct 16; indirect HL
-} oparg;
+} sm83_oparg_t;
 
 typedef enum
 {
@@ -206,6 +263,10 @@ void jit_memfix(void)
     #endif
 }
 
+/*
+    Represents an arm instruction or short sequence of arm instructions.
+    One sm83 instructions can map to multiple resultant fragments (frag_t)
+*/
 typedef struct {
     void* args;
     
@@ -217,53 +278,57 @@ typedef struct {
     const uint8_t* romsrc;
     uint8_t length; // this is set from produce() and recorded for debugging purposes
     #endif
-} armop;
+} frag_t;
 
-// disassembly state.
+// translation state.
 static struct {
-    armop* arm;
-    uint16_t armc;
-    uint16_t armcap;
+    frag_t* frag;
+    uint16_t fragc;
+    uint16_t fragcap;
     const uint8_t* romstart;
     const uint8_t* rom;
     const uint8_t* romend;
     unsigned done : 1;
     unsigned error : 1;
     
-    // registers assigned
+    // registers in, registers used, and registers out (i.e. modified)
+    // if used: must push register if >= 4
+    // if input: must read the register at start of block
+    // if dirty: must write the register back to the regfile at the end of the block
     unsigned use_r_a: 1;
-    unsigned init_r_a : 1;
+    unsigned input_r_a : 1;
     unsigned dirty_r_a : 1;
     unsigned use_r_bc: 1;
-    unsigned init_r_bc : 1;
+    unsigned input_r_bc : 1;
     unsigned dirty_r_bc : 1;
     unsigned use_r_de: 1;
-    unsigned init_r_de : 1;
+    unsigned input_r_de : 1;
     unsigned dirty_r_de : 1;
     unsigned use_r_hl: 1;
-    unsigned init_r_hl : 1;
+    unsigned input_r_hl : 1;
     unsigned dirty_r_hl : 1;
     unsigned use_r_sp: 1;
-    unsigned init_r_sp : 1;
+    unsigned input_r_sp : 1;
     unsigned dirty_r_sp : 1;
     unsigned use_r_regfile : 1;
     unsigned use_r_flex : 1;
     unsigned use_lr : 1;
 } dis;
 
-static uint8_t dis_read_rom_byte(void)
+static uint8_t sm83_next_byte(void)
 {
     return *(dis.rom++);
 }
 
-static uint16_t dis_read_rom_hword(void)
+static uint16_t sm83_next_word(void)
 {
-    uint16_t x = dis_read_rom_byte();
-    x |= dis_read_rom_byte() << 8;
+    uint16_t x = sm83_next_byte();
+    x |= sm83_next_byte() << 8;
     return x;
 }
 
-static int is_reghi(oparg reg)
+// is high 8 bits of 16-bit register (B, H, D)
+static int is_reghi(sm83_oparg_t reg)
 {
     switch(reg)
     {
@@ -276,8 +341,8 @@ static int is_reghi(oparg reg)
     }
 }
 
-
-static int is_reglo(oparg reg)
+// is low 8 bits of 16-bit register (C, E, L)
+static int is_reglo(sm83_oparg_t reg)
 {
     switch(reg)
     {
@@ -290,7 +355,8 @@ static int is_reglo(oparg reg)
     }
 }
 
-static int is_reg8(oparg reg)
+// is 8-bit register (A, B, C, D, E, H, L)
+static int is_reg8(sm83_oparg_t reg)
 {
     switch(reg)
     {
@@ -307,7 +373,7 @@ static int is_reg8(oparg reg)
     }
 }
 
-static int is_reg16(oparg reg)
+static int is_reg16(sm83_oparg_t reg)
 {
     switch(reg)
     {
@@ -321,7 +387,7 @@ static int is_reg16(oparg reg)
     }
 }
 
-static int reg_armidx(oparg reg)
+static int reg_armidx(sm83_oparg_t reg)
 {
     switch(reg)
     {
@@ -349,7 +415,7 @@ static int reg_armidx(oparg reg)
 }
 
 // reg must be one of OPARG_A, OPARG_BC, OPARG_DE, OPARG_HL.
-static void use_register(oparg reg, int dependency, int dirty)
+static void use_register(sm83_oparg_t reg, int dependency, int dirty)
 {
     switch (reg)
     {
@@ -358,7 +424,7 @@ static void use_register(oparg reg, int dependency, int dirty)
         case OPARG_A:
             if (dependency && !dis.use_r_a)
             {
-                dis.init_r_a = 1;
+                dis.input_r_a = 1;
             }
             if (dirty)
             {
@@ -372,7 +438,7 @@ static void use_register(oparg reg, int dependency, int dirty)
         case OPARG_BC:
             if (dependency && !dis.use_r_bc)
             {
-                dis.init_r_bc = 1;
+                dis.input_r_bc = 1;
             }
             if (dirty)
             {
@@ -386,7 +452,7 @@ static void use_register(oparg reg, int dependency, int dirty)
         case OPARG_DE:
             if (dependency && !dis.use_r_de)
             {
-                dis.init_r_de = 1;
+                dis.input_r_de = 1;
             }
             if (dirty)
             {
@@ -400,7 +466,7 @@ static void use_register(oparg reg, int dependency, int dirty)
         case OPARG_HL:
             if (dependency && !dis.use_r_hl)
             {
-                dis.init_r_hl = 1;
+                dis.input_r_hl = 1;
             }
             if (dirty)
             {
@@ -412,7 +478,7 @@ static void use_register(oparg reg, int dependency, int dirty)
         case OPARG_SP:
             if (dependency && !dis.use_r_sp)
             {
-                dis.init_r_sp = 1;
+                dis.input_r_sp = 1;
             }
             if (dirty)
             {
@@ -437,19 +503,19 @@ static uint32_t swap16_32(uint32_t a)
 #define FWD_BUFF() (outbuff_base ? outbuff : outbuff_base)
 #define WRITE_BUFF_END() ((uintptr_t)outbuff - (uintptr_t)outbuff_base) / sizeof(*outbuff)
 
-static uint8_t disp_skip(void* args, uint16_t* outbuff)
+static uint8_t fasm_skip(void* args, uint16_t* outbuff)
 {
     return 0;
 }
 
-static uint8_t disp_16(void* args, uint16_t* outbuff)
+static uint8_t fasm_16(void* args, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
     WRITE_BUFF_16((uintptr_t)args);
     return WRITE_BUFF_END();
 }
 
-static uint8_t disp_32(void* args, uint16_t* outbuff)
+static uint8_t fasm_32(void* args, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
     WRITE_BUFF_32((uintptr_t)args);
@@ -457,25 +523,51 @@ static uint8_t disp_32(void* args, uint16_t* outbuff)
 }
 
 #ifdef JIT_DEBUG
-    #define ARMOP(...) ({armop op = {__VA_ARGS__}; op.romsrc = NULL; op.length = 0; op;})
+    #define FRAG(...) ({frag_t op = {__VA_ARGS__}; op.romsrc = NULL; op.length = 0; op;})
 #else
-        #define ARMOP(...) ({armop op = {__VA_ARGS__}; op;})
+    #define FRAG(...) ({frag_t op = {__VA_ARGS__}; op;})
 #endif
 
-static void dis_instr16(uint16_t instr)
+static void frag_instr16(uint16_t instr)
 {
-    dis.arm[dis.armc++] = ARMOP(
+    dis.frag[dis.fragc++] = FRAG(
         .args = (void*)(uintptr_t)instr,
-        .produce = disp_16
+        .produce = fasm_16
     );
 }
 
-static void dis_instr32(uint32_t instr)
+static void frag_instr32(uint32_t instr)
 {
-    dis.arm[dis.armc++] = ARMOP(
+    dis.frag[dis.fragc++] = FRAG(
         .args = (void*)(uintptr_t)instr,
-        .produce = disp_32
+        .produce = fasm_32
     );
+}
+
+static uint8_t input_registers(void)
+{
+    uint32_t reg_push = 0;
+    if (dis.input_r_a)
+    {
+        reg_push |= 1 << REG_A;
+    }
+    if (dis.input_r_bc)
+    {
+        reg_push |= 1 << REG_BC;
+    }
+    if (dis.input_r_de)
+    {
+        reg_push |= 1 << REG_DE;
+    }
+    if (dis.input_r_hl)
+    {
+        reg_push |= 1 << REG_HL;
+    }
+    if (dis.input_r_sp)
+    {
+        reg_push |= 1 << REG_SP;
+    }
+    return reg_push;
 }
 
 static uint8_t used_registers(void)
@@ -535,7 +627,34 @@ static uint8_t dirty_registers(void)
     return reg_push;
 }
 
-static uint8_t disp_bl(void* fn, uint16_t* outbuff)
+static uint32_t bitsmear_right(uint32_t b)
+{
+    b = b | (b >> 1);
+    b = b | (b >> 2);
+    b = b | (b >> 4);
+    b = b | (b >> 8);
+    b = b | (b >> 16);
+    return b;
+}
+
+static uint32_t bitsmear_left(uint32_t b)
+{
+    b = b | (b << 1);
+    b = b | (b << 2);
+    b = b | (b << 4);
+    b = b | (b << 8);
+    b = b | (b << 16);
+    return b;
+}
+
+// turns all bits to 1 except for leading and trailing 0s.
+// e.g. converts 0b0010100100 to 0b0011111100.
+static uint32_t contiguous_bits(uint32_t b)
+{
+    return bitsmear_left(b) & bitsmear_right(b);
+}
+
+static uint8_t fasm_bl(void* fn, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
     
@@ -564,7 +683,7 @@ static uint8_t disp_bl(void* fn, uint16_t* outbuff)
 }
 
 // call function directly.
-static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
+static uint8_t fasm_delegate(void* fn, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
     
@@ -578,7 +697,7 @@ static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
         WRITE_BUFF_16(reg_push | 0xb400);
     }
     
-    outbuff += disp_bl(fn, FWD_BUFF());
+    outbuff += fasm_bl(fn, FWD_BUFF());
     
     if (reg_push)
     {
@@ -589,29 +708,29 @@ static uint8_t disp_delegate(void* fn, uint16_t* outbuff)
     return WRITE_BUFF_END();
 }
 
-static void dis_delegate(fn_type fn)
+static void frag_delegate(fn_type fn)
 {
     dis.use_lr = 1;
-    dis.arm[dis.armc++] = ARMOP(
+    dis.frag[dis.fragc++] = FRAG(
         .args = (void*)fn,
-        .produce = disp_delegate
+        .produce = fasm_delegate
     );
 }
 
-static void dis_bl(fn_type fn)
+static void frag_bl(fn_type fn)
 {
-    dis.arm[dis.armc++] = ARMOP(
+    dis.frag[dis.fragc++] = FRAG(
         .args = (void*)fn,
-        .produce = disp_bl
+        .produce = fasm_bl
     );
 }
 
-static void dis_set_n(void)
+static void frag_set_n(void)
 {
     // TODO
 }
 
-static void dis_clear_n(void)
+static void frag_clear_n(void)
 {
     // TODO
 }
@@ -631,42 +750,42 @@ static unsigned thumbexpand_encoding(uint8_t value, unsigned ror)
     }
 }
 
-static void dis_inc(oparg arg)
+static void frag_inc(sm83_oparg_t arg)
 {
-    dis_clear_n();
+    frag_clear_n();
     // TODO
 }
 
-static void dis_dec(oparg arg)
+static void frag_dec(sm83_oparg_t arg)
 {
-    dis_set_n();
+    frag_set_n();
     // TODO
 }
 
-static void dis_ld(oparg dst, oparg src)
+static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
 {
     if (dst == OPARG_HLmi)
     {
-        dis_ld(OPARG_HLm, src);
-        dis_inc(OPARG_HL);
+        frag_ld(OPARG_HLm, src);
+        frag_inc(OPARG_HL);
         return;
     }
     else if (dst == OPARG_HLmd)
     {
-        dis_ld(OPARG_HLm, src);
-        dis_dec(OPARG_HL);
+        frag_ld(OPARG_HLm, src);
+        frag_dec(OPARG_HL);
         return;
     }
     else if (src == OPARG_HLmi)
     {
-        dis_ld(dst, OPARG_HLm);
-        dis_inc(OPARG_HL);
+        frag_ld(dst, OPARG_HLm);
+        frag_inc(OPARG_HL);
         return;
     }
     else if (src == OPARG_HLmd)
     {
-        dis_ld(dst, OPARG_HLm);
-        dis_dec(OPARG_HL);
+        frag_ld(dst, OPARG_HLm);
+        frag_dec(OPARG_HL);
         return;
     }
     
@@ -674,8 +793,8 @@ static void dis_ld(oparg dst, oparg src)
     use_register(dst, 0, 1);
     
     unsigned immediate = 0;
-    if (src == OPARG_i8 || src == OPARG_i8m || src == OPARG_i8sp) immediate = dis_read_rom_byte();
-    if (src == OPARG_i16 || src == OPARG_i16m) immediate = dis_read_rom_hword();
+    if (src == OPARG_i8 || src == OPARG_i8m || src == OPARG_i8sp) immediate = sm83_next_byte();
+    if (src == OPARG_i16 || src == OPARG_i16m) immediate = sm83_next_word();
 
     if (is_reg8(dst))
     {
@@ -686,14 +805,14 @@ static void dis_ld(oparg dst, oparg src)
             {
                 // movs r%a, imm
                 // cf. ARMv7-M Architecture Reference Manual A6-148, Encoding T1
-                dis_instr16(0x2000 | (immediate) | (reg_armidx(dst) << 8));
+                frag_instr16(0x2000 | (immediate) | (reg_armidx(dst) << 8));
             }
             else
             {
                 if (is_reghi(dst))
                 {
                     // [A6.7.149] uxtb r%dst, r%dst
-                    dis_instr16(
+                    frag_instr16(
                         0xB2C0
                         | (reg_armidx(dst) << 3)
                         | (reg_armidx(dst) << 0)
@@ -704,7 +823,7 @@ static void dis_ld(oparg dst, oparg src)
                     {
                         unsigned imm_encoding = thumbexpand_encoding(immediate, 24);
                         JIT_DEBUG_MESSAGE("thumbexpenc: %8x", imm_encoding);
-                        dis_instr32(
+                        frag_instr32(
                             0xf0400000
                             | (bits(imm_encoding, 11, 1) << 26)
                             | (reg_armidx(dst) << 16)
@@ -718,7 +837,7 @@ static void dis_ld(oparg dst, oparg src)
                 {
                     // and r%dst, $ff00
                     unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    dis_instr32(
+                    frag_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
                         | (reg_armidx(dst) << 16)
@@ -730,7 +849,7 @@ static void dis_ld(oparg dst, oparg src)
                     // orr  r%dst, imm
                     if (immediate != 0)
                     {
-                        dis_instr32(
+                        frag_instr32(
                             0xF0400000
                             | (reg_armidx(dst) << 8)
                             | (reg_armidx(dst) << 16)
@@ -748,7 +867,7 @@ static void dis_ld(oparg dst, oparg src)
                 if (is_reghi(src))
                 {
                     // lsrs r%dst, r%src, 8
-                    dis_instr16(
+                    frag_instr16(
                         0x0A00
                         | (reg_armidx(dst) << 0)
                         | (reg_armidx(src) << 3)
@@ -757,14 +876,14 @@ static void dis_ld(oparg dst, oparg src)
                 else
                 {
                     // movs r%dst, r%src
-                    dis_instr16(
+                    frag_instr16(
                         0x0000
                         | (reg_armidx(dst) << 0)
                         | (reg_armidx(src) << 3)
                     );
                     
                     // uxtb r%dst, r%dst
-                    dis_instr16(
+                    frag_instr16(
                         0xB2C0
                         | (reg_armidx(dst) << 3)
                         | (reg_armidx(dst) << 0)
@@ -776,14 +895,14 @@ static void dis_ld(oparg dst, oparg src)
                 if (is_reghi(dst))
                 {
                     // uxtb r%dst, r%dst
-                    dis_instr16(
+                    frag_instr16(
                         0xB2C0
                         | (reg_armidx(dst) << 3)
                         | (reg_armidx(dst) << 0)
                     );
                     
                     // orr r%dst, r%dst, r%src, lsl #8
-                    dis_instr32(
+                    frag_instr32(
                         0xEA402000
                         | (reg_armidx(dst) << 16)
                         | (reg_armidx(dst) << 8)
@@ -794,7 +913,7 @@ static void dis_ld(oparg dst, oparg src)
                 {
                     // and r%dst, $ff00
                     unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    dis_instr32(
+                    frag_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
                         | (reg_armidx(dst) << 16)
@@ -804,7 +923,7 @@ static void dis_ld(oparg dst, oparg src)
                     );
                     
                     // orr r%dst, r%src
-                    dis_instr16(
+                    frag_instr16(
                         0x4300
                         | (reg_armidx(dst) << 0)
                         | (reg_armidx(src) << 3)
@@ -818,7 +937,7 @@ static void dis_ld(oparg dst, oparg src)
                     if (is_reghi(src))
                     {
                         // lsrs r, r, $8
-                        dis_instr16(
+                        frag_instr16(
                             0x0A00
                             | (reg_armidx(dst) << 3)
                             | (reg_armidx(dst) << 0)
@@ -827,7 +946,7 @@ static void dis_ld(oparg dst, oparg src)
                     else
                     {
                         // uxtb r, r
-                        dis_instr16(
+                        frag_instr16(
                             0xB2C0
                             | (reg_armidx(dst) << 3)
                             | (reg_armidx(dst) << 0)
@@ -835,7 +954,7 @@ static void dis_ld(oparg dst, oparg src)
                     }
                     
                     // orr r, r, r, lsl #8
-                    dis_instr32(
+                    frag_instr32(
                         0xEA402000
                         | (reg_armidx(dst) << 16)
                         | (reg_armidx(dst) << 8)
@@ -845,18 +964,18 @@ static void dis_ld(oparg dst, oparg src)
                 else if (is_reghi(dst) && is_reghi(src))
                 {
                     // uxtb r%dst, r%dst
-                    dis_instr16(
+                    frag_instr16(
                         0xB2C0
                         | (reg_armidx(dst) << 3)
                         | (reg_armidx(dst) << 0)
                     );
                     
                     // push {r%src}
-                    dis_instr16((1 << reg_armidx(src)) | 0xb400);
+                    frag_instr16((1 << reg_armidx(src)) | 0xb400);
                     
                     // and r%src, $ff00
                     unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    dis_instr32(
+                    frag_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
                         | (reg_armidx(src) << 16)
@@ -866,20 +985,20 @@ static void dis_ld(oparg dst, oparg src)
                     );
                     
                     // orr r%dst, r%src
-                    dis_instr16(
+                    frag_instr16(
                         0x4300
                         | (reg_armidx(dst) << 0)
                         | (reg_armidx(src) << 3)
                     );
                     
                     // pop {r%src}
-                    dis_instr16((1 << reg_armidx(src)) | 0xbc00);
+                    frag_instr16((1 << reg_armidx(src)) | 0xbc00);
                 }
                 else if (is_reglo(dst) && is_reglo(src))
                 {
                     // and r%dst, $ff00
                     unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    dis_instr32(
+                    frag_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
                         | (reg_armidx(dst) << 16)
@@ -889,37 +1008,37 @@ static void dis_ld(oparg dst, oparg src)
                     );
                     
                     // push {r%src}
-                    dis_instr16((1 << reg_armidx(src)) | 0xb400);
+                    frag_instr16((1 << reg_armidx(src)) | 0xb400);
                     
                     // uxtb r%src, r%src
-                    dis_instr16(
+                    frag_instr16(
                         0xB2C0
                         | (reg_armidx(src) << 3)
                         | (reg_armidx(src) << 0)
                     );
                     
                     // orr r%dst, r%src
-                    dis_instr16(
+                    frag_instr16(
                         0x4300
                         | (reg_armidx(dst) << 0)
                         | (reg_armidx(src) << 3)
                     );
                     
                     // pop {r%src}
-                    dis_instr16((1 << reg_armidx(src)) | 0xbc00);
+                    frag_instr16((1 << reg_armidx(src)) | 0xbc00);
                 }
                 else if (is_reghi(dst) && !is_reghi(src))
                 {
                     
                     // uxtb r%dst, r%dst
-                    dis_instr16(
+                    frag_instr16(
                         0xB2C0
                         | (reg_armidx(dst) << 3)
                         | (reg_armidx(dst) << 0)
                     );
                     
                     // orr r%dst, r%dst, r%src, lsl #8
-                    dis_instr32(
+                    frag_instr32(
                         0xEA402000
                         | (reg_armidx(dst) << 16)
                         | (reg_armidx(dst) << 8)
@@ -929,7 +1048,7 @@ static void dis_ld(oparg dst, oparg src)
                     // OPTIMIZE -- can skip this if we know src's hi is 0.
                     // and r%dst, $ff00
                     unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    dis_instr32(
+                    frag_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
                         | (reg_armidx(dst) << 16)
@@ -942,7 +1061,7 @@ static void dis_ld(oparg dst, oparg src)
                 {
                     // and r%dst, $ff00
                     unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    dis_instr32(
+                    frag_instr32(
                         0xf0000000
                         | (bits(imm_encoding, 11, 1) << 26)
                         | (reg_armidx(dst) << 16)
@@ -952,7 +1071,7 @@ static void dis_ld(oparg dst, oparg src)
                     );
                     
                     // orr r%dst, r%dst, r%src, lsr #8
-                    dis_instr32(
+                    frag_instr32(
                         0xEA502010
                         | (reg_armidx(dst) << 16)
                         | (reg_armidx(dst) << 8)
@@ -972,16 +1091,16 @@ static void dis_ld(oparg dst, oparg src)
         
         // push {...}
         unsigned regs = used_registers() & 0xf & ~(1 << REG_FLEX);
-        if (regs) dis_instr16(regs | 0xb400);
+        if (regs) frag_instr16(regs | 0xb400);
         
         // movs r0, r%src
-        dis_instr16(0x0000 | (reg_armidx(src) << 3));
+        frag_instr16(0x0000 | (reg_armidx(src) << 3));
         
         // call read
-        dis_bl((fn_type)opts.read);
+        frag_bl((fn_type)opts.read);
         
         // pop {...}
-        if (regs) dis_instr16(regs | 0xbc00);
+        if (regs) frag_instr16(regs | 0xbc00);
     }
     else if (is_reg16(dst))
     {
@@ -989,7 +1108,7 @@ static void dis_ld(oparg dst, oparg src)
         // e.g. ld bc, $1234
         {
             // movw r%dst, imm
-            dis_instr32(
+            frag_instr32(
                 0xF2400000
                 | (reg_armidx(dst) << 8)
                 | (bits(immediate, 0, 8) << 0)
@@ -1009,106 +1128,106 @@ static void dis_ld(oparg dst, oparg src)
     }
 }
 
-static void dis_rotate(rotate_type rt, oparg dst)
+static void frag_rotate(rotate_type rt, sm83_oparg_t dst)
 {
     // TODO
 }
 
-static void dis_swap(oparg dst)
+static void frag_swap(sm83_oparg_t dst)
 {
     // TODO
 }
 
-static void dis_jump(oparg condition, oparg addrmode)
+static void frag_jump(sm83_oparg_t condition, sm83_oparg_t addrmode)
 {
     // TODO
 }
 
-static void dis_call(oparg condition)
+static void frag_call(sm83_oparg_t condition)
 {
     // TODO
 }
 
-static void dis_rst(unsigned x)
+static void frag_rst(unsigned x)
 {
     // TODO
 }
 
-static void dis_ret(oparg condition)
+static void frag_ret(sm83_oparg_t condition)
 {
     // TODO
 }
 
-static void dis_reti(void)
+static void frag_reti(void)
 {
 }
 
 // convert to bcd
-static void dis_daa(void)
+static void frag_daa(void)
 {
 }
 
 // set carry flag
-static void dis_scf(void)
+static void frag_scf(void)
 {
 }
 
 // flip carry flag
-static void dis_ccf(void)
+static void frag_ccf(void)
 {
 }
 
 // one's complement of A
-static void dis_cpl(void)
+static void frag_cpl(void)
 {
 }
 
-static void dis_di(void)
+static void frag_di(void)
 {
 }
 
-static void dis_ei(void)
+static void frag_ei(void)
 {
 }
 
-static void dis_add(oparg dst, oparg src, int carry)
+static void frag_add(sm83_oparg_t dst, sm83_oparg_t src, int carry)
 {
 }
 
-static void dis_sub(oparg dst, oparg src, int carry)
+static void frag_sub(sm83_oparg_t dst, sm83_oparg_t src, int carry)
 {
 }
 
-static void dis_cp(oparg cmp)
+static void frag_cp(sm83_oparg_t cmp)
 {
 }
 
-static void dis_and(oparg src)
+static void frag_and(sm83_oparg_t src)
 {
 }
 
-static void dis_or(oparg src)
+static void frag_or(sm83_oparg_t src)
 {
 }
 
-static void dis_xor(oparg src)
+static void frag_xor(sm83_oparg_t src)
 {
 }
 
-static void dis_bit(unsigned b, oparg src)
+static void frag_bit(unsigned b, sm83_oparg_t src)
 {
 }
 
 // v: 0 if clear, 1 if set.
-static void dis_set(unsigned b, oparg src, int v)
+static void frag_set(unsigned b, sm83_oparg_t src, int v)
 {
 }
 
-static void dis_push(oparg src)
+static void frag_push(sm83_oparg_t src)
 {
 }
 
-static void dis_pop(oparg src)
+static void frag_pop(sm83_oparg_t src)
 {
 }
 
@@ -1116,28 +1235,28 @@ static int disassemble_done(void)
 {
     if (dis.error) return 1;
     if (dis.rom >= dis.romend - 2) return 1;
-    if (dis.armc >= 0x200) return 1;
+    if (dis.fragc >= 0x200) return 1;
     return dis.done;
 }
 
 static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, uint32_t gb_end_offset)
 {
     memset(&dis, 0, sizeof(dis));
-    dis.armcap = 0x100;
-    dis.arm = (armop*)malloc(dis.armcap * sizeof(armop));
-    if (!dis.arm)
+    dis.fragcap = 0x100;
+    dis.frag = (frag_t*)malloc(dis.fragcap * sizeof(frag_t));
+    if (!dis.frag)
     {
         dis.error = 1;
         return;
     }
     for (size_t i = 0; i < JIT_START_PADDING_ENTRY_C; ++i)
     {
-        dis.arm[i] = ARMOP(
-            .produce = disp_skip
+        dis.frag[i] = FRAG(
+            .produce = fasm_skip
         );
     }
     dis.use_r_a = 1;
-    dis.armc = JIT_START_PADDING_ENTRY_C;
+    dis.fragc = JIT_START_PADDING_ENTRY_C;
     dis.rom = (const uint8_t*)opts.rom + gb_rom_offset;
     dis.romend = (const uint8_t*)opts.rom + gb_end_offset;
     dis.romstart = (const uint8_t*)opts.rom + gb_start_offset;
@@ -1145,22 +1264,22 @@ static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, 
 
 static void disassemble_capacity(void)
 {
-    if (dis.armc >= dis.armcap - 0x80)
+    if (dis.fragc >= dis.fragcap - 0x80)
     {
-        dis.armcap *= 2;
-        armop* arm = (armop*)realloc(dis.arm, dis.armcap * sizeof(armop));
+        dis.fragcap *= 2;
+        frag_t* arm = (frag_t*)realloc(dis.frag, dis.fragcap * sizeof(frag_t));
         if (arm == NULL)
         {
             dis.error = 1;
         }
         else
         {
-            dis.arm = arm;
+            dis.frag = arm;
         }
     }
 }
 
-static oparg arg_from_op(uint8_t op)
+static sm83_oparg_t arg_from_op(uint8_t op)
 {
     switch (op % 0x8)
     {
@@ -1190,200 +1309,200 @@ static void disassemble_instruction(void)
 {
     disassemble_capacity();
     uint8_t op;
-    switch (op = dis_read_rom_byte())
+    switch (op = sm83_next_byte())
     {
         case 0x00: // NOP
             return;
             
         case 0x01:
-            return dis_ld(OPARG_BC, OPARG_i16);
+            return frag_ld(OPARG_BC, OPARG_i16);
             
         case 0x02:
-            return dis_ld(OPARG_BCm, OPARG_A);
+            return frag_ld(OPARG_BCm, OPARG_A);
             
         case 0x03:
-            return dis_inc(OPARG_BC);
+            return frag_inc(OPARG_BC);
         
         case 0x04:
-            return dis_inc(OPARG_B);
+            return frag_inc(OPARG_B);
             
         case 0x05:
-            return dis_dec(OPARG_B);
+            return frag_dec(OPARG_B);
             
         case 0x06:
-            return dis_ld(OPARG_B, OPARG_i8);
+            return frag_ld(OPARG_B, OPARG_i8);
             
         case 0x07:
-            return dis_rotate(ROT_LEFT_CARRY, OPARG_A);
+            return frag_rotate(ROT_LEFT_CARRY, OPARG_A);
             
         case 0x08:
-            return dis_ld(OPARG_i16m, OPARG_SP);
+            return frag_ld(OPARG_i16m, OPARG_SP);
             
         case 0x09:
-            return dis_add(OPARG_HL, OPARG_BC, 0);
+            return frag_add(OPARG_HL, OPARG_BC, 0);
             
         case 0x0A:
-            return dis_ld(OPARG_A, OPARG_BCm);
+            return frag_ld(OPARG_A, OPARG_BCm);
             
         case 0x0B:
-            return dis_dec(OPARG_BC);
+            return frag_dec(OPARG_BC);
             
         case 0x0C:
-            return dis_inc(OPARG_C);
+            return frag_inc(OPARG_C);
             
         case 0x0D:
-            return dis_dec(OPARG_C);
+            return frag_dec(OPARG_C);
         
         case 0x0E:
-            return dis_ld(OPARG_C, OPARG_i8);
+            return frag_ld(OPARG_C, OPARG_i8);
             
         case 0x0F:
-            return dis_rotate(ROT_RIGHT_CARRY, OPARG_A);
+            return frag_rotate(ROT_RIGHT_CARRY, OPARG_A);
         
         case 0x10: // STOP
             dis.done = 1;
-            return dis_delegate(opts.stop);
+            return frag_delegate(opts.stop);
             
         case 0x11:
-            return dis_ld(OPARG_DE, OPARG_i16);
+            return frag_ld(OPARG_DE, OPARG_i16);
             
         case 0x12:
-            return dis_ld(OPARG_DEm, OPARG_A);
+            return frag_ld(OPARG_DEm, OPARG_A);
             
         case 0x13:
-            return dis_inc(OPARG_DE);
+            return frag_inc(OPARG_DE);
             
         case 0x14:
-            return dis_inc(OPARG_D);
+            return frag_inc(OPARG_D);
             
         case 0x15:
-            return dis_dec(OPARG_D);
+            return frag_dec(OPARG_D);
             
         case 0x16:
-            return dis_ld(OPARG_D, OPARG_i8);
+            return frag_ld(OPARG_D, OPARG_i8);
             
         case 0x17:
-            return dis_rotate(ROT_LEFT, OPARG_A);
+            return frag_rotate(ROT_LEFT, OPARG_A);
             
         case 0x18:
-            return dis_jump(COND_none, ADDR_r8);
+            return frag_jump(COND_none, ADDR_r8);
             
         case 0x19:
-            return dis_add(OPARG_HL, OPARG_DE, 0);
+            return frag_add(OPARG_HL, OPARG_DE, 0);
             
         case 0x1A:
-            return dis_ld(OPARG_A, OPARG_DEm);
+            return frag_ld(OPARG_A, OPARG_DEm);
             
         case 0x1B:
-            return dis_dec(OPARG_DE);
+            return frag_dec(OPARG_DE);
             
         case 0x1C:
-            return dis_inc(OPARG_E);
+            return frag_inc(OPARG_E);
             
         case 0x1D:
-            return dis_dec(OPARG_E);
+            return frag_dec(OPARG_E);
             
         case 0x1E:
-            return dis_ld(OPARG_E, OPARG_i8);
+            return frag_ld(OPARG_E, OPARG_i8);
             
         case 0x1F:
-            return dis_rotate(ROT_RIGHT, OPARG_A);
+            return frag_rotate(ROT_RIGHT, OPARG_A);
             
         case 0x20:
-            return dis_jump(COND_nz, ADDR_r8);
+            return frag_jump(COND_nz, ADDR_r8);
             
         case 0x21:
-            return dis_ld(OPARG_HLmi, OPARG_A);
+            return frag_ld(OPARG_HLmi, OPARG_A);
             
         case 0x22:
-            return dis_inc(OPARG_HL);
+            return frag_inc(OPARG_HL);
             
         case 0x23:
-            return dis_inc(OPARG_HL);
+            return frag_inc(OPARG_HL);
             
         case 0x24:
-            return dis_inc(OPARG_H);
+            return frag_inc(OPARG_H);
             
         case 0x25:
-            return dis_dec(OPARG_H);
+            return frag_dec(OPARG_H);
             
         case 0x26:
-            return dis_ld(OPARG_HLm, OPARG_i8);
+            return frag_ld(OPARG_HLm, OPARG_i8);
             
         case 0x27:
-            return dis_daa();
+            return frag_daa();
             
         case 0x28:
-            return dis_jump(COND_z, ADDR_r8);
+            return frag_jump(COND_z, ADDR_r8);
             
         case 0x29:
-            return dis_add(OPARG_HL, OPARG_HL, 0);
+            return frag_add(OPARG_HL, OPARG_HL, 0);
             
         case 0x2A:
-            return dis_ld(OPARG_A, OPARG_HLmi);
+            return frag_ld(OPARG_A, OPARG_HLmi);
             
         case 0x2B:
-            return dis_dec(OPARG_HL);
+            return frag_dec(OPARG_HL);
             
         case 0x2C:
-            return dis_inc(OPARG_L);
+            return frag_inc(OPARG_L);
             
         case 0x2D:
-            return dis_dec(OPARG_L);
+            return frag_dec(OPARG_L);
             
         case 0x2E:
-            return dis_ld(OPARG_L, OPARG_i8);
+            return frag_ld(OPARG_L, OPARG_i8);
             
         case 0x2F:
-            return dis_cpl();
+            return frag_cpl();
             
         case 0x30:
-            return dis_jump(COND_nc, ADDR_r8);
+            return frag_jump(COND_nc, ADDR_r8);
             
         case 0x31:
-            return dis_ld(OPARG_SP, OPARG_i16);
+            return frag_ld(OPARG_SP, OPARG_i16);
             
         case 0x32:
-            return dis_ld(OPARG_HLmd, OPARG_A);
+            return frag_ld(OPARG_HLmd, OPARG_A);
             
         case 0x33:
-            return dis_inc(OPARG_SP);
+            return frag_inc(OPARG_SP);
             
         case 0x34:
-            return dis_inc(OPARG_HLm);
+            return frag_inc(OPARG_HLm);
             
         case 0x35:
-            return dis_dec(OPARG_HLm);
+            return frag_dec(OPARG_HLm);
             
         case 0x36:
-            return dis_ld(OPARG_HL, OPARG_i8);
+            return frag_ld(OPARG_HL, OPARG_i8);
             
         case 0x37:
-            return dis_scf();
+            return frag_scf();
             
         case 0x38:
-            return dis_jump(COND_c, ADDR_r8);
+            return frag_jump(COND_c, ADDR_r8);
             
         case 0x39:
-            return dis_add(OPARG_HL, OPARG_SP, 0);
+            return frag_add(OPARG_HL, OPARG_SP, 0);
             
         case 0x3A:
-            return dis_ld(OPARG_A, OPARG_HLmd);
+            return frag_ld(OPARG_A, OPARG_HLmd);
             
         case 0x3B:
-            return dis_dec(OPARG_SP);
+            return frag_dec(OPARG_SP);
             
         case 0x3C:
-            return dis_inc(OPARG_A);
+            return frag_inc(OPARG_A);
             
         case 0x3D:
-            return dis_dec(OPARG_A);
+            return frag_dec(OPARG_A);
             
         case 0x3E:
-            return dis_ld(OPARG_A, OPARG_i8);
+            return frag_ld(OPARG_A, OPARG_i8);
             
         case 0x3F:
-            return dis_ccf();
+            return frag_ccf();
         
         // register transfer
         case 0x40 ... 0x75:
@@ -1391,241 +1510,322 @@ static void disassemble_instruction(void)
             switch (op / 0x8)
             {
                 case 0x40/8:
-                    return dis_ld(OPARG_B, arg_from_op(op));
+                    return frag_ld(OPARG_B, arg_from_op(op));
                 case 0x48/8:
-                    return dis_ld(OPARG_C, arg_from_op(op));
+                    return frag_ld(OPARG_C, arg_from_op(op));
                 case 0x50/8:
-                    return dis_ld(OPARG_D, arg_from_op(op));
+                    return frag_ld(OPARG_D, arg_from_op(op));
                 case 0x58/8:
-                    return dis_ld(OPARG_E, arg_from_op(op));
+                    return frag_ld(OPARG_E, arg_from_op(op));
                 case 0x60/8:
-                    return dis_ld(OPARG_H, arg_from_op(op));
+                    return frag_ld(OPARG_H, arg_from_op(op));
                 case 0x68/8:
-                    return dis_ld(OPARG_L, arg_from_op(op));
+                    return frag_ld(OPARG_L, arg_from_op(op));
                 case 0x70/8:
-                    return dis_ld(OPARG_HLm, arg_from_op(op));
+                    return frag_ld(OPARG_HLm, arg_from_op(op));
                 case 0x78/8:
-                    return dis_ld(OPARG_A, arg_from_op(op));
+                    return frag_ld(OPARG_A, arg_from_op(op));
             }
             
         case 0x76: // HALT
             dis.done = 1;
             JIT_DEBUG_MESSAGE("disassembling HALT");
-            return dis_delegate(opts.halt);
+            return frag_delegate(opts.halt);
             
         // arithmetic
         case 0x80 ... 0xBF:
             switch (op)
             {
             case 0x80 ... 0x87:
-                return dis_add(OPARG_A, arg_from_op(op), 0);
+                return frag_add(OPARG_A, arg_from_op(op), 0);
             case 0x88 ... 0x8F:
-                return dis_add(OPARG_A, arg_from_op(op), 1);
+                return frag_add(OPARG_A, arg_from_op(op), 1);
             case 0x90 ... 0x97:
-                return dis_sub(OPARG_A, arg_from_op(op), 0);
+                return frag_sub(OPARG_A, arg_from_op(op), 0);
             case 0x98 ... 0x9F:
-                return dis_sub(OPARG_A, arg_from_op(op), 1);
+                return frag_sub(OPARG_A, arg_from_op(op), 1);
             case 0xA0 ... 0xA7:
-                return dis_and(arg_from_op(op));
+                return frag_and(arg_from_op(op));
             case 0xA8 ... 0xAF:
-                return dis_xor(arg_from_op(op));
+                return frag_xor(arg_from_op(op));
             case 0xB0 ... 0xB7:
-                return dis_or(arg_from_op(op));
+                return frag_or(arg_from_op(op));
             case 0xB8 ... 0xBF:
-                return dis_cp(arg_from_op(op));
+                return frag_cp(arg_from_op(op));
             }
         
         case 0xC0:
-            return dis_ret(COND_nz);
+            return frag_ret(COND_nz);
         
         case 0xC1:
-            return dis_pop(OPARG_BC);
+            return frag_pop(OPARG_BC);
             
         case 0xC2:
-            return dis_jump(COND_nz, OPARG_i16);
+            return frag_jump(COND_nz, OPARG_i16);
             
         case 0xC3:
-            return dis_jump(COND_none, OPARG_i16);
+            return frag_jump(COND_none, OPARG_i16);
             
         case 0xC4:
-            return dis_call(COND_nz);
+            return frag_call(COND_nz);
             
         case 0xC5:
-            return dis_push(OPARG_BC);
+            return frag_push(OPARG_BC);
             
         case 0xC6:
-            return dis_add(OPARG_A, OPARG_i8, 0);
+            return frag_add(OPARG_A, OPARG_i8, 0);
             
         case 0xC7:
-            return dis_rst(0);
+            return frag_rst(0);
         
         case 0xC8:
-            return dis_ret(COND_z);
+            return frag_ret(COND_z);
         
         case 0xC9:
-            return dis_ret(COND_none);
+            return frag_ret(COND_none);
             
         case 0xCA:
-            return dis_jump(COND_z, OPARG_i16);
+            return frag_jump(COND_z, OPARG_i16);
             
         case 0xCB:
             {
-                uint8_t opx = dis_read_rom_byte();
-                oparg arg = arg_from_op(opx);
+                uint8_t opx = sm83_next_byte();
+                sm83_oparg_t arg = arg_from_op(opx);
                 switch(opx/8)
                 {
                 case 0x00/8:
-                    return dis_rotate(ROT_LEFT_CARRY, arg);
+                    return frag_rotate(ROT_LEFT_CARRY, arg);
                 case 0x08/8:
-                    return dis_rotate(ROT_RIGHT_CARRY, arg);
+                    return frag_rotate(ROT_RIGHT_CARRY, arg);
                 case 0x10/8:
-                    return dis_rotate(ROT_LEFT, arg);
+                    return frag_rotate(ROT_LEFT, arg);
                 case 0x18/8:
-                    return dis_rotate(ROT_RIGHT, arg);
+                    return frag_rotate(ROT_RIGHT, arg);
                 case 0x20/8:
-                    return dis_rotate(SHIFT_LEFT, arg);
+                    return frag_rotate(SHIFT_LEFT, arg);
                 case 0x28/8:
-                    return dis_rotate(SHIFT_RIGHT, arg);
+                    return frag_rotate(SHIFT_RIGHT, arg);
                 case 0x30/8:
-                    return dis_swap(arg);
+                    return frag_swap(arg);
                 case 0x38/8:
-                    return dis_rotate(SHIFT_RIGHT_L, arg);
+                    return frag_rotate(SHIFT_RIGHT_L, arg);
                 case 0x40/8 ... 0x78/8:
-                    return dis_bit((opx/8 - 0x40/8), arg);
+                    return frag_bit((opx/8 - 0x40/8), arg);
                 case 0x80/8 ... 0xB8/8:
-                    return dis_set((opx/8 - 0x80/8), arg, 0);
+                    return frag_set((opx/8 - 0x80/8), arg, 0);
                 case 0xC0/8 ... 0xF8/8:
-                    return dis_set((opx/8 - 0xC0/8), arg, 1);
+                    return frag_set((opx/8 - 0xC0/8), arg, 1);
                 }
             }
             
         case 0xCC:
-            return dis_call(COND_z);
+            return frag_call(COND_z);
             
         case 0xCD:
-            return dis_call(COND_none);
+            return frag_call(COND_none);
             
         case 0xCE:
-            return dis_add(OPARG_A, OPARG_i8, 1);
+            return frag_add(OPARG_A, OPARG_i8, 1);
             
         case 0xCF:
-            return dis_rst(1);
+            return frag_rst(1);
             
         case 0xD0:
-            return dis_ret(COND_nc);
+            return frag_ret(COND_nc);
         
         case 0xD1:
-            return dis_pop(OPARG_DE);
+            return frag_pop(OPARG_DE);
             
         case 0xD2:
-            return dis_jump(COND_nc, OPARG_i16);
+            return frag_jump(COND_nc, OPARG_i16);
             
         case 0xD4:
-            return dis_call(COND_nc);
+            return frag_call(COND_nc);
             
         case 0xD5:
-            return dis_push(OPARG_DE);
+            return frag_push(OPARG_DE);
             
         case 0xD6:
-            return dis_sub(OPARG_A, OPARG_i8, 0);
+            return frag_sub(OPARG_A, OPARG_i8, 0);
             
         case 0xD7:
-            return dis_rst(2);
+            return frag_rst(2);
         
         case 0xD8:
-            return dis_ret(COND_c);
+            return frag_ret(COND_c);
         
         case 0xD9:
-            return dis_reti();
+            return frag_reti();
             
         case 0xDA:
-            return dis_jump(COND_c, OPARG_i16);
+            return frag_jump(COND_c, OPARG_i16);
             
         case 0xDC:
-            return dis_call(COND_c);
+            return frag_call(COND_c);
             
         case 0xDE:
-            return dis_sub(OPARG_A, OPARG_i8, 1);
+            return frag_sub(OPARG_A, OPARG_i8, 1);
             
         case 0xDF:
-            return dis_rst(3);
+            return frag_rst(3);
             
         case 0xE0:
-            return dis_ld(OPARG_i8m, OPARG_A);
+            return frag_ld(OPARG_i8m, OPARG_A);
             
         case 0xE1:
-            return dis_pop(OPARG_HL);
+            return frag_pop(OPARG_HL);
             
         case 0xE2:
-            return dis_ld(OPARG_Cm, OPARG_A);
+            return frag_ld(OPARG_Cm, OPARG_A);
             
         case 0xE5:
-            return dis_push(OPARG_HL);
+            return frag_push(OPARG_HL);
             
         case 0xE6:
-            return dis_and(OPARG_i8);
+            return frag_and(OPARG_i8);
             
         case 0xE7:
-            return dis_rst(4);
+            return frag_rst(4);
             
         case 0xE8:
-            return dis_add(OPARG_SP, OPARG_i8, 0);
+            return frag_add(OPARG_SP, OPARG_i8, 0);
             
         case 0xE9:
-            return dis_jump(COND_none, ADDR_HL);
+            return frag_jump(COND_none, ADDR_HL);
             
         case 0xEA:
-            return dis_ld(OPARG_i16m, OPARG_A);
+            return frag_ld(OPARG_i16m, OPARG_A);
             
         case 0xED:
-            return dis_xor(OPARG_i8);
+            return frag_xor(OPARG_i8);
             
         case 0xEF:
-            return dis_rst(5);
+            return frag_rst(5);
             
         case 0xF0:
-            return dis_ld(OPARG_A, OPARG_i8m);
+            return frag_ld(OPARG_A, OPARG_i8m);
             
         case 0xF1:
-            return dis_pop(OPARG_AF);
+            return frag_pop(OPARG_AF);
             
         case 0xF2:
-            return dis_ld(OPARG_A, OPARG_Cm);
+            return frag_ld(OPARG_A, OPARG_Cm);
             
         case 0xF3:
-            return dis_di();
+            return frag_di();
             
         case 0xF5:
-            return dis_push(OPARG_AF);
+            return frag_push(OPARG_AF);
             
         case 0xF6:
-            return dis_or(OPARG_i8);
+            return frag_or(OPARG_i8);
             
         case 0xF7:
-            return dis_rst(6);
+            return frag_rst(6);
             
         case 0xF8:
-            return dis_ld(OPARG_HL, OPARG_i8sp);
+            return frag_ld(OPARG_HL, OPARG_i8sp);
             
         case 0xF9:
-            return dis_ld(OPARG_SP, OPARG_HL);
+            return frag_ld(OPARG_SP, OPARG_HL);
             
         case 0xFA:
-            return dis_ld(OPARG_A, OPARG_i16m);
+            return frag_ld(OPARG_A, OPARG_i16m);
             
         case 0xFB:
-            return dis_ei();
+            return frag_ei();
             
         case 0xFD:
-            return dis_cp(OPARG_i8);
+            return frag_cp(OPARG_i8);
             
         case 0xFF:
-            return dis_rst(7);
+            return frag_rst(7);
             
         default:
             dis.done = 1;
-            dis_delegate(opts.illegal);
+            frag_delegate(opts.illegal);
     }
+}
+
+// these next two functions are estimates / heuristics
+// feel free to reimplement them.
+
+struct regfile_io_strategy_t {
+    uint16_t read_regs;
+    uint16_t write_regs;
+    
+    // 0 if no registers accessed
+    // 1 to access individually
+    // 2 for load/store multiple
+    int ldtype;
+    int sttype;
+};
+
+#define SMEAR(a) (bitsmear_right(a) & ~1)
+
+static int access_strategy_for_bits(uint16_t regs)
+{
+    uint32_t smearwaste = __builtin_popcount(SMEAR(regs) & ~(regs|1));
+    switch (__builtin_popcount(regs))
+    {
+    case 0:
+        return 0;
+    case 1:
+        return 1;
+    case 2:
+        return 1 + (smearwaste <= 1);
+    case 3:
+        return 1 + (smearwaste <= 3);
+    default:
+        return 2;
+    }
+    return 2;
+}
+
+static struct regfile_io_strategy_t get_regfile_io_strategy(void)
+{
+    struct regfile_io_strategy_t strat;
+    uint32_t in = input_registers() & ~1;
+    uint32_t out = dirty_registers() & ~1;
+    
+    assert(REG_REGF == 0);
+    uint32_t would_be_clobbered_if_writesmear_loadsingle = ~(in | dirty_registers()) & SMEAR(out);
+    uint32_t writesmear_waste = SMEAR(out) & ~out;
+    uint32_t readsmear_waste = SMEAR(in | (SMEAR(out) & ~dirty_registers())) & ~out & ~in;
+    
+    // should use cycle counting to calculate these weights
+    int smear_advantage =
+        __builtin_popcount(out)
+        - __builtin_popcount(writesmear_waste)
+        + __builtin_popcount(in)
+        - __builtin_popcount(readsmear_waste) * 2;
+    
+    if (smear_advantage > 0)
+    {
+        // force load the non-dirty smeared out registers
+        in |= SMEAR(out) & ~dirty_registers();
+    }
+    
+    strat.ldtype = access_strategy_for_bits(in);
+    strat.sttype = access_strategy_for_bits(out);
+    
+    // regardless of above reimplementation, the following must hold because
+    // it satisfies important invariants regarding ldm/stm sequentiality.
+    
+    if (strat.sttype == 2)
+    {
+        if (~(in | dirty_registers()) & SMEAR(out))
+        {
+            strat.sttype = 1;
+        }
+    }
+    
+    strat.read_regs = in;
+    strat.write_regs = out;
+    if (strat.ldtype == 2) strat.read_regs = SMEAR(strat.read_regs);
+    if (strat.sttype == 2) strat.write_regs = SMEAR(strat.write_regs);
+    
+    return strat;
 }
 
 static void disassemble_padding(void)
@@ -1639,10 +1839,10 @@ static void disassemble_padding(void)
     
     // prologue size cannot exceed JIT_START_PADDING_ENTRY_C
     
-    #define epilogue_16(x) dis_instr16(x)
-    #define epilogue_32(x) dis_instr32(x)
-    #define prologue_16(x) do { dis.arm[padc++] = ARMOP(.args=(void*)(uintptr_t)(x), .produce=disp_16); } while (0)
-    #define prologue_32(x) do { dis.arm[padc++] = ARMOP(.args=(void*)(uintptr_t)(x), .produce=disp_32);  } while (0)
+    #define epilogue_16(x) frag_instr16(x)
+    #define epilogue_32(x) frag_instr32(x)
+    #define prologue_16(x) do { dis.frag[padc++] = FRAG(.args=(void*)(uintptr_t)(x), .produce=fasm_16); } while (0)
+    #define prologue_32(x) do { dis.frag[padc++] = FRAG(.args=(void*)(uintptr_t)(x), .produce=fasm_32);  } while (0)
     
     size_t padc = 0;
     
@@ -1689,53 +1889,68 @@ static void disassemble_padding(void)
         }
     }
     
-    if (dis.init_r_a)
-    {
-        prologue_16(
-            0x6800
-            | (offsetof(jit_regfile_t, a) << 6)
-            | (REG_REGF << 3)
-            | (REG_A << 0)
-        );
-    }
+    struct regfile_io_strategy_t strat = get_regfile_io_strategy();
     
-    if (dis.init_r_bc)
+    switch (strat.ldtype)
     {
+    case 0:
+        break;
+    case 1:
+        if (strat.read_regs & (1 << REG_A))
+        {
+            prologue_16(
+                0x6800
+                | (offsetof(jit_regfile_t, a) << 6)
+                | (REG_REGF << 3)
+                | (REG_A << 0)
+            );
+        }
+        
+        if (strat.read_regs & (1 << REG_BC))
+        {
+            prologue_16(
+                0x8800
+                | (offsetof(jit_regfile_t, bc) << 5)
+                | (REG_REGF << 3)
+                | (REG_BC << 0)
+            );
+        }
+        
+        if (strat.read_regs & (1 << REG_DE))
+        {
+            prologue_16(
+                0x8800
+                | (offsetof(jit_regfile_t, de) << 5)
+                | (REG_REGF << 3)
+                | (REG_DE << 0)
+            );
+        }
+        
+        if (strat.read_regs & (1 << REG_HL))
+        {
+            prologue_16(
+                0x8800
+                | (offsetof(jit_regfile_t, hl) << 5)
+                | (REG_REGF << 3)
+                | (REG_HL << 0)
+            );
+        }
+        
+        if (strat.read_regs & (1 << REG_SP))
+        {
+            prologue_16(
+                0x8800
+                | (offsetof(jit_regfile_t, sp) << 5)
+                | (REG_REGF << 3)
+                | (REG_SP << 0)
+            );
+        }
+        break;
+    case 2:
+        // [A6.7.40] LDM r0, { ... }
+        assert(strat.read_regs == SMEAR(strat.read_regs));
         prologue_16(
-            0x8800
-            | (offsetof(jit_regfile_t, bc) << 5)
-            | (REG_REGF << 3)
-            | (REG_BC << 0)
-        );
-    }
-    
-    if (dis.init_r_de)
-    {
-        prologue_16(
-            0x8800
-            | (offsetof(jit_regfile_t, de) << 5)
-            | (REG_REGF << 3)
-            | (REG_DE << 0)
-        );
-    }
-    
-    if (dis.init_r_hl)
-    {
-        prologue_16(
-            0x8800
-            | (offsetof(jit_regfile_t, hl) << 5)
-            | (REG_REGF << 3)
-            | (REG_HL << 0)
-        );
-    }
-    
-    if (dis.init_r_sp)
-    {
-        prologue_16(
-            0x8800
-            | (offsetof(jit_regfile_t, sp) << 5)
-            | (REG_REGF << 3)
-            | (REG_SP << 0)
+            0xC800 | strat.read_regs
         );
     }
     
@@ -1745,57 +1960,76 @@ static void disassemble_padding(void)
         epilogue_16(0xbc00 | REG_FLEX);
     }
     
-    if (dis.dirty_r_a)
+    switch (strat.sttype)
     {
-        // write value of A back to regfile
-        // strb r%a, [r%regf, offsetof(jit_regfile, a)]
-        epilogue_16(
-            0x7000
-            | (offsetof(jit_regfile_t, a) << 6)
-            | (REG_REGF << 3)
-            | (REG_A << 0)
-        );
-    }
+    case 0: // no write/read necessary.
+        break;
+    case 1: // write individually
+        if (strat.write_regs & (1 << REG_A))
+        {
+            // write value of A back to regfile
+            // strb r%a, [r%regf, offsetof(jit_regfile, a)]
+            epilogue_16(
+                0x7000
+                | ((offsetof(jit_regfile_t, a) / sizeof(uint32_t)) << 6)
+                | (REG_REGF << 3)
+                | (REG_A << 0)
+            );
+        }
+        
+        if (strat.write_regs & (1 << REG_BC))
+        {
+            // strh r%bc, [r%regf, offsetof(jit_regfile, bc)]
+            epilogue_16(
+                0x8000
+                | ((offsetof(jit_regfile_t, bc)/2) << 6)
+                | (REG_REGF << 3)
+                | (REG_BC << 0)
+            );
+        }
+        
+        if (strat.write_regs & (1 << REG_DE))
+        {
+            epilogue_16(
+                0x8000
+                | ((offsetof(jit_regfile_t, de)/2) << 6)
+                | (REG_REGF << 3)
+                | (REG_DE << 0)
+            );
+        }
+        
+        if (strat.write_regs & (1 << REG_HL))
+        {
+            epilogue_16(
+                0x8000
+                | ((offsetof(jit_regfile_t, hl)/2) << 6)
+                | (REG_REGF << 3)
+                | (REG_HL << 0)
+            );
+        }
+        
+        if (strat.write_regs & (1 << REG_SP))
+        {
+            epilogue_16(
+                0x8000
+                | ((offsetof(jit_regfile_t, sp)/2) << 6)
+                | (REG_REGF << 3)
+                | (REG_SP << 0)
+            );
+        }
+        break;
+    case 2: // we can use the store-multiple instruction
     
-    if (dis.dirty_r_bc)
-    {
-        // strh r%bc, [r%regf, offsetof(jit_regfile, bc)]
-        epilogue_16(
-            0x8000
-            | ((offsetof(jit_regfile_t, bc)/2) << 6)
-            | (REG_REGF << 3)
-            | (REG_BC << 0)
-        );
-    }
+        assert(strat.write_regs == SMEAR(strat.write_regs));
+        
+        // mustn't clobber anything...
+        assert (!(~(strat.read_regs | dirty_registers()) & strat.write_regs));
     
-    if (dis.dirty_r_de)
-    {
+        // STM r0, { ... }
         epilogue_16(
-            0x8000
-            | ((offsetof(jit_regfile_t, de)/2) << 6)
-            | (REG_REGF << 3)
-            | (REG_DE << 0)
+            0xC000 | strat.write_regs
         );
-    }
-    
-    if (dis.dirty_r_hl)
-    {
-        epilogue_16(
-            0x8000
-            | ((offsetof(jit_regfile_t, hl)/2) << 6)
-            | (REG_REGF << 3)
-            | (REG_HL << 0)
-        );
-    }
-    
-    if (dis.dirty_r_sp)
-    {
-        epilogue_16(
-            0x8000
-            | ((offsetof(jit_regfile_t, sp)/2) << 6)
-            | (REG_REGF << 3)
-            | (REG_SP << 0)
-        );
+        break;
     }
     
     // pop {...}
@@ -1822,7 +2056,7 @@ static void* disassemble_end(void)
 {
     if (dis.error)
     {
-        if (dis.arm) free(dis.arm);
+        if (dis.frag) free(dis.frag);
         return NULL;
     }
     
@@ -1831,11 +2065,11 @@ static void* disassemble_end(void)
     // accumulate size of output
     
     size_t outsize = 0;
-    for (size_t i = 0; i < dis.armc; ++i)
+    for (size_t i = 0; i < dis.fragc; ++i)
     {
-        uint8_t size = dis.arm[i].produce(dis.arm[i].args, NULL);
+        uint8_t size = dis.frag[i].produce(dis.frag[i].args, NULL);
         #ifdef JIT_DEBUG
-        dis.arm[i].length = size;
+        dis.frag[i].length = size;
         #endif
         outsize += size;
     }
@@ -1845,16 +2079,16 @@ static void* disassemble_end(void)
     if (!out)
     {
         dis.error = 1;
-        if (dis.arm) free(dis.arm);
+        if (dis.frag) free(dis.frag);
         return NULL;
     }
     
     JIT_DEBUG_MESSAGE("base address: %8x", out);
     uint16_t* outb = out;
     
-    for (size_t i = 0; i < dis.armc; ++i)
+    for (size_t i = 0; i < dis.fragc; ++i)
     {
-        outb += dis.arm[i].produce(dis.arm[i].args, outb);
+        outb += dis.frag[i].produce(dis.frag[i].args, outb);
     }
     
     #ifdef JIT_DEBUG
@@ -1867,16 +2101,16 @@ static void* disassemble_end(void)
     for (const uint16_t* arm = out; arm && arm < out+outsize;)
     {
         // zip along with arm disp as well
-        while (armseek < arm - out || (dis.arm[armi].length == 0 && armseek < outsize))
+        while (armseek < arm - out || (dis.frag[armi].length == 0 && armseek < outsize))
         {
-            armseek += dis.arm[armi++].length;
+            armseek += dis.frag[armi++].length;
         }
         
         if (armseek == arm - out)
         {
-            if (dis.arm[armi].romsrc)
+            if (dis.frag[armi].romsrc)
             {
-                printf("; z80: %02X", *dis.arm[armi].romsrc);
+                printf("\n; sm83: %02X", *dis.frag[armi].romsrc);
             }
         }
         const uint16_t* armprev = arm;
@@ -1898,7 +2132,7 @@ static void* disassemble_end(void)
     spin(); spin(); spin();
     #endif
     
-    free(dis.arm);
+    free(dis.frag);
     
     return arm_interworking_thumb(out);
 }
@@ -1918,16 +2152,16 @@ static jit_fn jit_compile(uint16_t gb_addr, uint16_t gb_bank)
     // disassemble each gameboy instruction one at a time.
     {
         #ifdef JIT_DEBUG
-        size_t armi_prev = dis.armc;
+        size_t armi_prev = dis.fragc;
         const uint8_t* romsrc = dis.rom;
         #endif
         
         disassemble_instruction();
         
         #ifdef JIT_DEBUG
-        if (dis.armc > armi_prev)
+        if (dis.fragc > armi_prev)
         {
-            dis.arm[armi_prev].romsrc = romsrc;
+            dis.frag[armi_prev].romsrc = romsrc;
         }
         #endif
     }

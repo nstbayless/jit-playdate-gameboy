@@ -1,0 +1,4 @@
+- write to PC upon exit
+    - note that this can be statically calculated -- every chunk ends at the same PC position(s)
+- return number of cycles in r0
+- take context as argument in r0? use another reg. for scratch?

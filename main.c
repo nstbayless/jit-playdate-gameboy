@@ -16,6 +16,7 @@ static const uint8_t gbrom_nop[] = {
 };
 
 static const uint8_t gbrom_ld[] = {
+	0x7C,               // ld a, h
 	0x3E, 0x69,  		// ld a, $69
 	0x06, 0x3A,  		// ld b, $3A
 	0x11, 0x34, 0x12,   // ld de, $1234
@@ -185,8 +186,6 @@ int eventHandler
 		jit_assert(regs.de == 0x1234);
 		#endif
 		
-		return 0;
-		
 		playdate->system->logToConsole("Transfer:");
 		do_test(gbrom_transfer);
 		#ifdef TARGET_PLAYDATE
@@ -195,13 +194,11 @@ int eventHandler
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
 		
-		jit_assert(regs.a == 0x20);
+		jit_assert(regs.a == 0x69); // from previous test
 		jit_assert(regs.bc == 0x2020);
 		jit_assert(regs.de == 0x3333);
 		jit_assert(regs.hl == 0x2020);
 		#endif
-		
-		return 0;
 		
 		playdate->system->logToConsole("Mem Access:");
 		do_test(gbrom_memaccess);
