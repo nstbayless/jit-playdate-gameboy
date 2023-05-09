@@ -1,4 +1,5 @@
-// disassemble arm
+#pragma once
+// disassemble thumb (arm)
 
 #include <stdint.h>
 

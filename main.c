@@ -84,6 +84,17 @@ static void test_write(uint16_t addr, uint8_t value)
 	}
 }
 
+static uint16_t test_read_word(uint16_t addr)
+{
+	return test_read(addr) | (test_read(addr + 1) << 1);
+}
+
+static void test_write_word(uint16_t addr, uint16_t value)
+{
+	test_write(addr, value & 0x00ff);
+	test_write(addr+1, value >> 8);
+}
+
 static void spin(void)
 {
     for (size_t i = 0; i < 0x40000; ++i) asm("nop");
@@ -100,11 +111,15 @@ void do_test(const uint8_t* rom)
 		.illegal = test_illegal,
 		.read = test_read,
 		.write = test_write,
+		.readword = test_read_word,
+		.writeword = test_write_word,
 		.regs = &regs,
+		.fixed_bank = 1,
 		.is_gb_color = 0,
 		.playdate = playdate
 	};
 	regs.pc = 0;
+	regs.sp = 0xfffe;
 	halt = 0;
 	
 	playdate->system->logToConsole("Initialize jit.\n");
@@ -171,7 +186,6 @@ int eventHandler
 		playdate->system->setAutoLockDisabled(0);
 		playdate->system->logToConsole("Nop:");
 		do_test(gbrom_nop);
-		
 		
 		playdate->system->logToConsole("Ld:");
 		do_test(gbrom_ld);

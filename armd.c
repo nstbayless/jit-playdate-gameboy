@@ -1,7 +1,7 @@
 #include "armd.h"
+#include "map.h"
 
 #include <stddef.h>
-#include <map.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -51,7 +51,7 @@ static int decode_16(const uint16_t arm, uintptr_t base);
 #define ptr_to_uint(x) ((uintptr_t)(void*)x)
 #define TODO " [TODO]"
 
-int prop(const char* fmt, ...)
+static int prop(const char* fmt, ...)
 {
     va_list args;
     va_start(args, fmt);

@@ -24,7 +24,7 @@ endif
 VPATH +=
 
 # List C source files here
-SRC += main.c jit.c armd.c pdnewlib.c
+SRC += main.c jit.c armd.c sm38d.c pdnewlib.c
 
 # List all user directories here
 UINCDIR += $(VPATH) ./STM32CubeF7/Drivers/CMSIS/Include ./STM32CubeF7/Drivers/CMSIS/Device/ST/STM32F7xx/Include

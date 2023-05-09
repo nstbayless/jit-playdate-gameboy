@@ -3,18 +3,20 @@
 #include "pd_api.h"
 #include <stdint.h>
 
-typedef void (*jit_fn)(void);
 
 typedef struct
 {
     // we store as 32-bit instead of 16 for better alignment properties.
     uint32_t a;
-    uint32_t hl;
     uint32_t bc;
     uint32_t de;
+    uint32_t hl;
     uint32_t sp;
     uint32_t pc;
+
 } jit_regfile_t;
+
+typedef void (*jit_fn)(jit_regfile_t*);
 
 typedef struct
 {
@@ -26,7 +28,10 @@ typedef struct
     void (*illegal)(void);
     uint8_t (*read)(uint16_t addr);
     void (*write)(uint16_t addr, uint8_t value);
+    uint16_t (*readword)(uint16_t addr);
+    void (*writeword)(uint16_t addr, uint16_t value);
     jit_regfile_t* regs;
+    unsigned fixed_bank : 1; // 1 if the bank the code is in is switchable. (if no mapper, this should be 0.)
     unsigned is_gb_color : 1;
     PlaydateAPI* playdate;
 } jit_opts;
@@ -46,4 +51,7 @@ jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank);
 #ifndef __NDEBUG_
     #define jit_assert(_A) do {if (!(_A)) playdate->system->error("assertion failed: " #_A);} while (0)
     #define jit_assert_pd(_A, _PD) do {if (!(_A)) (_PD)->system->error("assertion failed: " #_A);} while (0)
+#else
+    #define jit_assert(...) {}
+    #define jit_assert_pd(...) {}
 #endif

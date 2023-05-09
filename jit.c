@@ -1,5 +1,6 @@
 #include "jit.h"
 #include "armd.h"
+#include "sm38d.h"
 
 /*
     Useful resources when developing this JIT:
@@ -21,15 +22,17 @@
         - each sm83 instruction can be multiple ARM instructions.
         - only sm83 instructions from ROM are translated; if the gameboy's program counter is in ram or somewhere else exotic, the dynarec is skipped.
         - additionally, some arm instructions are added to the start and end ("prologue" and "epilogue") of the chunk to interface with emulator (loading/storing registers, etc.).
-        - arm registers obey these invariants, which are assumed at the start and end of each transpiled sm83 instruction:
-            - r1 = A  (high 3 bytes are always 0)
-            - r2 = HL ()
-            - r3 = BC
-            - r4 = DE
-            - r5 = SP
-            - (r0 = pointer to jit_regfile_t, also used as flex/scratch, and to return cycle count at the end...it's still a bit vague and WIP.)
-            - (note that some registers may not be loaded in the prologue if they are not inputs for this chunk)
-            - (similarly, some registers may not be written in the epilogue if they are not modified this chunk)
+        - arm registers obey these invariants, which are assumed at the start and end of each transpiled sm83 instruction, as well as at the end of the prologue and the start of the epilogue:
+            - r1 = A (high 3 bytes are always 0)
+            - r2 = HL (high 2 bytes are always 0)
+            - r3 = DE (high 2 bytes are always 0)
+            - r4 = BC (high 2 bytes are always 0)
+            - r5 = SP (high 2 bytes are always 0)
+            - r6 = Carry (only 1 bit is used)
+            - r7 = pointer to jit_regfile_t
+            - (r0 is used as flex/scratch, and to return cycle count at the end)
+            - (note that some registers might not be loaded from jit_regfile_t in the prologue if they are not inputs for this chunk)
+            - (similarly, some registers might not be written to jit_regfile_t in the epilogue if they are not modified this chunk)
         - dynamic recompiling is done by translating in the following passes:
             1. Fragmentation: each sm83 instruction is converted into multiple "translation fragments," or just "fragments" for short (frag_t).
                 - a fragment (frag_t) is a representation of an arm operation.
@@ -51,7 +54,16 @@
             - storing pc.
             - branching.
             - status flags
-                
+            - often we push r1 when we don't need to (used_registers() | 2)
+*/
+
+/*
+    OPTIMIZATION IDEAS
+    - these sm83 commands don't exist: ld bc,hl; ld de,bc; and so on.
+        - they are emulated in sm83 by instruction pairs e.g. push hl, pop bc; ld b,h; ld c, l
+        - we can identify this and reduce to just one arm mov instruction.
+        
+    - we can analyze the rst routines and inline them
 */
 
 #ifndef JIT_DEBUG
@@ -75,6 +87,7 @@
 #ifndef true
     #define true 1
 #endif
+typedef int bool;
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -92,8 +105,8 @@
 
 // TODO: assign registers programatically
 // reg_flex MUST be reg 0, because r0 is the return register.
-#define REG_REGF 0
-#define REG_FLEX REG_REGF
+#define REG_REGF 7
+#define REG_FLEX 0
 
 // keep in mind that 4+ are caller-saved
 // these are the arm registers used to store the given sm83 registers
@@ -127,10 +140,16 @@ typedef enum
 {
     OPARG_A, OPARG_B, OPARG_C, OPARG_D, OPARG_E, OPARG_H, OPARG_L,
     OPARG_AF, OPARG_BC, OPARG_DE, OPARG_HL, OPARG_SP,
-    OPARG_Cm, OPARG_BCm, OPARG_DEm, OPARG_HLm, OPARG_HLmi, OPARG_HLmd,
-    OPARG_i8, OPARG_i16, OPARG_i8sp,
+    OPARG_Cm, // appears in opcodes 0xE2 and 0xF2 only
+    OPARG_BCm, OPARG_DEm, OPARG_HLm, OPARG_HLmi, OPARG_HLmd,
+    OPARG_i8, OPARG_i16,
+    OPARG_i8sp, // appears in opcode 0xF8 only
     OPARG_i8m, OPARG_i16m,
+    
+    // condition codes
     COND_none, COND_z, COND_c, COND_nz, COND_nc,
+    
+    // jump destinations
     ADDR_r8, ADDR_d16, ADDR_HL // relative 8; direct 16; indirect HL
 } sm83_oparg_t;
 
@@ -169,6 +188,11 @@ static void* arm_interworking_thumb(void* fn)
 static uint32_t bits(uint32_t src, uint32_t lowbit, uint32_t bitc)
 {
     return (src >> lowbit) & ((1 << bitc) - 1);
+}
+
+static uint32_t bit(uint32_t src, uint32_t bit)
+{
+    return bits(src, bit, 1);
 }
 
 static void jit_add_ht_entry(uint16_t gb_addr, uint16_t gb_bank, jit_fn fn)
@@ -234,9 +258,9 @@ static void spin(void)
 void jit_init(jit_opts _opts)
 {
     opts = _opts;
-    JIT_DEBUG_MESSAGE("memset.\n");
+    //JIT_DEBUG_MESSAGE("memset.\n");
     memset(jit_hashtable, 0, sizeof(jit_hashtable));
-    JIT_DEBUG_MESSAGE("memfix.\n");
+    //JIT_DEBUG_MESSAGE("memfix.\n");
     jit_memfix();
 }
 
@@ -288,6 +312,7 @@ static struct {
     const uint8_t* romstart;
     const uint8_t* rom;
     const uint8_t* romend;
+
     unsigned done : 1;
     unsigned error : 1;
     
@@ -408,6 +433,8 @@ static int reg_armidx(sm83_oparg_t reg)
     case OPARG_HL:
     case OPARG_HLm:
         return REG_HL;
+    case OPARG_SP:
+        return REG_SP;
     default:
         assert(false);
         return 0;
@@ -654,6 +681,17 @@ static uint32_t contiguous_bits(uint32_t b)
     return bitsmear_left(b) & bitsmear_right(b);
 }
 
+// address is "safe" to write into if it won't cause a bankswap.
+// if a bankswap could occur when writing to this address, then we have to
+// stop dynarec after this instruction because we could suddenly be in a different bank.
+// (admittedly, it's extremely unlikely to switch the active bank, but it could happen.)
+static int sm83_addr_safe_write(uint16_t addr)
+{
+    if (opts.fixed_bank) return true;
+    if (addr >= 0x200 && addr < 0x6000) return false;
+    return true;
+}
+
 static uint8_t fasm_bl(void* fn, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
@@ -670,10 +708,19 @@ static uint8_t fasm_bl(void* fn, uint16_t* outbuff)
     uint32_t j1 = (!(urel_addr & (1 << 21)) == !sign)
         ? 0x2000
         : 0x0000;
+        
     
-    JIT_DEBUG_MESSAGE("callsite address: %8x", outbuff);
-    JIT_DEBUG_MESSAGE("function address: %8x", fn);
-    JIT_DEBUG_MESSAGE("relative addr: %8x; sign %x, j2 %x, j1 %x\n", urel_addr, sign, j2, j1);
+    #ifdef TARGET_PLAYDATE
+    if ((int)urel_addr < -16777216 || (int)urel_addr > 16777214)
+    {
+        // shouldn't be possible -- playdate's memory is only 16 mb.
+        assert(false);
+    }
+    #endif
+    
+    //JIT_DEBUG_MESSAGE("callsite address: %8x", outbuff);
+    //JIT_DEBUG_MESSAGE("function address: %8x", fn);
+    //JIT_DEBUG_MESSAGE("relative addr: %8x; sign %x, j2 %x, j1 %x\n", urel_addr, sign, j2, j1);
     
     WRITE_BUFF_32(
         0xF000D000 | (urel_addr & 0x7ff) | ((urel_addr << 5) & 0x03ff0000) | j2 | j1 | sign
@@ -719,6 +766,7 @@ static void frag_delegate(fn_type fn)
 
 static void frag_bl(fn_type fn)
 {
+    dis.use_lr = 1;
     dis.frag[dis.fragc++] = FRAG(
         .args = (void*)fn,
         .produce = fasm_bl
@@ -750,6 +798,138 @@ static unsigned thumbexpand_encoding(uint8_t value, unsigned ror)
     }
 }
 
+static void frag_armpush(uint16_t regs)
+{
+    if (bit(regs, 15) || bit(regs, 13))
+    {
+        assert(false);
+    }
+    
+    if (regs == 0) return;
+    
+    if (!bits(regs, 8, 4))
+    {
+        frag_instr16(regs | 0xb400);
+    }
+    else
+    {
+        // TODO
+        assert(false);
+    }
+}
+
+static void frag_armpop(uint16_t regs)
+{
+    if (bit(regs, 15) || bit(regs, 13))
+    {
+        assert(false);
+    }
+    
+    if (regs == 0) return;
+    
+    if (!bits(regs, 8, 4) && !bit(regs, 14))
+    {
+        // pop { regs }
+        frag_instr16(regs | 0xbd00);
+    }
+    else
+    {
+        if (__builtin_popcount(regs) == 1)
+        {
+            if (bit(regs, 14))
+            {
+                // pop { lr }
+                frag_instr32(0xF85DEB04);
+            }
+            else
+            {
+                // TODO
+                assert(false);
+            }
+        }
+        else
+        {
+            // pop { regs }
+            frag_instr32(regs | 0xE8BD4000);
+        }
+    }
+}
+
+static void frag_imm12c_rd8_rn16(
+    uint32_t instruction,
+    uint8_t rd,
+    uint8_t rn,
+    bool setflags,
+    uint8_t value,
+    uint8_t ror
+)
+{
+    const uint32_t encoding = thumbexpand_encoding(value, ror);
+    frag_instr32(
+        instruction
+        | (rd << 8)
+        | (rn << 16)
+        | (setflags << 20)
+        | bits(encoding, 0, 8)
+        | (bits(encoding, 8, 3) << 12)
+        | (bit(encoding, 11) << 26)
+    );
+}
+
+// v: 0 if clear, 1 if set.
+// b: the bit to set (0-7)
+static void frag_set(unsigned b, sm83_oparg_t dst, int v)
+{
+    uint32_t instruction = (v)
+        // orr.w
+        ? 0xf0400000
+        // bic
+        : 0xf0200000;
+    
+    if (dst == OPARG_HLm)
+    {
+        use_register(dst, 1, 0);
+        dis.use_r_flex = 1;
+        
+        assert(REG_HL >= 4); // need this to be able to copy hl to r0 for argument.
+        frag_armpush((used_registers() | 2) & 0xe);
+        
+        // movs r0, r%hl
+        frag_instr16(0x0000 | (REG_HL << 3));
+        
+        frag_bl((fn_type)opts.read);
+        
+        // bic/orr r1,r0,#(1<<b)
+        frag_imm12c_rd8_rn16(instruction, 0, 1, false, 1, 32-b);
+        
+        // movs r0, r%hl
+        frag_instr16(0x0000 | (REG_HL << 3));
+        
+        frag_bl((fn_type)opts.write);
+        
+        frag_armpop((used_registers() | 2) & 0xe);
+        
+        // we have to stop if we write to rom.
+        if (!opts.fixed_bank) dis.done = 1;
+    }
+    else if (is_reg8(dst))
+    {
+        use_register(dst, 1, 1);
+        if (is_reghi(dst))
+        {
+            frag_imm12c_rd8_rn16(instruction, reg_armidx(dst), reg_armidx(dst), false, 1, 24-b);
+        }
+        else
+        {
+            frag_imm12c_rd8_rn16(instruction, reg_armidx(dst), reg_armidx(dst), false, 1, 32-b);
+        }
+    }
+    else
+    {
+        assert(false);
+    }
+}
+
 static void frag_inc(sm83_oparg_t arg)
 {
     frag_clear_n();
@@ -760,6 +940,132 @@ static void frag_dec(sm83_oparg_t arg)
 {
     frag_set_n();
     // TODO
+}
+
+// moves 16-bit immediate into the given register
+// no assumptions are made about the contents of dst
+static void frag_ld_imm16(int dstidx, uint16_t imm)
+{
+    #if 0
+    // disabled because affecting the flags is scary.
+    if (im <= 0xff)
+    {
+        // MOVS r%dst, imm
+        frag_instr16(
+            0x2000
+            | (imm)
+            | (dstidx << 8)
+        );
+    }
+    else
+    #endif
+    {
+        // MOVW r%dst, imm16 [T3]
+        frag_instr32(
+            0xf2400000
+            | (dstidx << 8)
+            | (bits(imm, 0, 8) << 0)
+            | (bits(imm, 8, 3) << 12)
+            | (bits(imm, 11, 1) << 26)
+            | (bits(imm, 12, 4) << 16)
+        );
+    }
+}
+
+// moves 8-bit sm83 register into r0 or r%a
+// dstidx must be the index of an arm register whose upper 24 bits can be assumed to be 0.
+static void frag_store_rz_reg8(int dstidx, sm83_oparg_t src)
+{
+    assert(dstidx == REG_A || dstidx == REG_FLEX);
+    assert(is_reg8(src));
+    
+    const uint8_t rn = reg_armidx(src);
+    const uint8_t rd = dstidx;
+    
+    if (is_reghi(src))
+    {
+        // lsrs r%dst, r%src, 8
+        frag_instr16(
+            0x0A00
+            | (rd << 0)
+            | (rn << 3)
+        );
+    }
+    else
+    {
+        // movs r%dst, r%src
+        frag_instr16(
+            0x0000
+            | (rd << 0)
+            | (rn << 3)
+        );
+        
+        // uxtb r%dst, r%dst
+        frag_instr16(
+            0xB2C0
+            | (rd << 3)
+            | (rd << 0)
+        );
+    }
+}
+
+// moves r0 or r%a into 8-bit sm83 register
+// srcidx must be the index of an arm register whose upper 24 bits can be assumed to be 0.
+static void frag_store_reg8_rz(int srcidx, sm83_oparg_t dst)
+{
+    assert(srcidx == REG_A || srcidx == REG_FLEX);
+    assert(is_reg8(dst));
+    
+    const uint8_t rd = reg_armidx(dst);
+    const uint8_t rn = srcidx;
+    
+    if (dst == OPARG_A)
+    {
+        if (srcidx != REG_A)
+        {
+            // movs r%a, r0 [T2]
+            frag_instr16(
+                0x0 | rd | (rn << 3)
+            );
+        }
+    }
+    else if (is_reglo(dst))
+    {
+        // and r%dst, r%dst, #0xff00
+        frag_instr32(
+            0xf400407f
+            | (rd << 8)
+            | (rn << 16)
+        );
+        
+        // orr r%dst, r%src
+        frag_instr16(
+            0x4300
+            | (rd << 0)
+            | (rn << 3)
+        );
+    }
+    else if (is_reghi(dst))
+    {
+        // uxtb r%dst,r%dst
+        frag_instr16(
+            0xb2c0
+            | (rd << 0)
+            | (rd << 3)
+        );
+        
+         // orr r%dst, r%dst, r%src, lsl #8
+        frag_instr32(
+            0xEA402000
+            | (rd << 16)
+            | (rd << 8)
+            | (rn << 0)
+        );
+    }
+    else
+    {
+        assert(false);
+    }
 }
 
 static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
@@ -793,10 +1099,129 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
     use_register(dst, 0, 1);
     
     unsigned immediate = 0;
-    if (src == OPARG_i8 || src == OPARG_i8m || src == OPARG_i8sp) immediate = sm83_next_byte();
-    if (src == OPARG_i16 || src == OPARG_i16m) immediate = sm83_next_word();
+    if (src == OPARG_i8 || src == OPARG_i8m || src == OPARG_i8sp
+        || dst == OPARG_i8 || dst == OPARG_i8m || dst == OPARG_i8sp)
+    {
+        immediate = sm83_next_byte();
+    }
+    else if (src == OPARG_i16 || src == OPARG_i16m || dst == OPARG_i16 || dst == OPARG_i16m)
+    {
+        immediate = sm83_next_word();
+    }
 
-    if (is_reg8(dst))
+    if (src == OPARG_BCm || src == OPARG_DEm || src == OPARG_HLm
+        || src == OPARG_i16m || src == OPARG_i8m || src == OPARG_Cm)
+    {
+        assert(is_reg8(dst));
+        dis.use_r_flex = 1;
+        
+        unsigned regs = used_registers() & 0xe;
+        
+        // we can skip preserving A if we're going to write to it.
+        if (dst == OPARG_A)
+        {
+            regs &= ~(1<<REG_A);
+        }
+        
+        frag_armpush(regs);
+        
+        switch (src)
+        {
+        case OPARG_BCm:
+        case OPARG_DEm:
+        case OPARG_HLm:
+            // movs r0, r%src
+            frag_instr16(0x0000 | (reg_armidx(src) << 3));
+            break;
+        case OPARG_i8m:
+            immediate |= 0xff00;
+            // fallthrough
+        case OPARG_i16m:
+            frag_ld_imm16(0, immediate);
+            break;
+        case OPARG_Cm:
+            // orr.w r0, r%bc, #$ff00
+            frag_instr32(
+                0xf440407f
+                | (REG_BC << 16)
+            );
+            break;
+        default:
+            assert(false);
+        }
+        
+        // call read
+        frag_bl((fn_type)opts.read);
+        
+        // pop {...}
+        frag_armpop(regs);
+        
+        // transfer r0 to dst
+        frag_store_reg8_rz(0, dst);
+    }
+    else if (
+        dst == OPARG_i16m || dst == OPARG_i8m || dst == OPARG_Cm
+        || dst == OPARG_BCm || dst == OPARG_DEm || dst == OPARG_HLm
+    )
+    {
+        assert(is_reg8(src));
+        dis.use_r_flex = 1;
+        
+        // FIXME: frag_push/frag_pop should be its own instruction, because
+        // if we clobber r1 and it's smear-written later... aaahh...
+        // well, we always push r1 as a result, but that isn't *always* needed!
+        
+        frag_armpush((used_registers() | 2) & 0xe);
+        
+        switch (dst)
+        {
+        case OPARG_BCm:
+        case OPARG_DEm:
+        case OPARG_HLm:
+            // movs r0, r%src
+            frag_instr16(0x0000 | (reg_armidx(dst) << 3));
+            break;
+        case OPARG_i8m:
+            immediate |= 0xff00;
+            // fallthrough
+        case OPARG_i16m:
+            frag_ld_imm16(0, immediate);
+            break;
+        case OPARG_Cm:
+            // orr.w r0, r%bc, #$ff00
+            frag_instr32(
+                0xf440407f
+                | (REG_BC << 16)
+            );
+            break;
+        default:
+            assert(false);
+        }
+        
+        // movs r1, value
+        assert (REG_A == 1);
+        if (src != OPARG_A)
+        {
+            // it's safe to clobber r1 with the write value
+            // because we'll pop r1 -> a later if it is needed.
+            frag_store_rz_reg8(1, src);
+        }
+        
+        // call write
+        frag_bl((fn_type)opts.write);
+        
+        // pop {...}
+        frag_armpop((used_registers() | 2) & 0xe);
+        
+        // we have to stop now because of the possibility of a bankswap under our feet.
+        if (!(dst == OPARG_i16m && sm83_addr_safe_write(immediate))
+        || dst == OPARG_i8m || dst == OPARG_Cm
+        || (opts.fixed_bank && (dst == OPARG_BCm || dst == OPARG_DEm || dst == OPARG_HLm)))
+        {
+            dis.done = true;
+        }
+    }
+    else if (is_reg8(dst))
     {
         if (src == OPARG_i8)
         // e.g. ld c, $50
@@ -805,7 +1230,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
             {
                 // movs r%a, imm
                 // cf. ARMv7-M Architecture Reference Manual A6-148, Encoding T1
-                frag_instr16(0x2000 | (immediate) | (reg_armidx(dst) << 8));
+                frag_ld_imm16(reg_armidx(dst), immediate);
             }
             else
             {
@@ -821,29 +1246,16 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     // [A6.7.90] orr  r%dst, r%dst, imm<<8
                     if (immediate != 0)
                     {
-                        unsigned imm_encoding = thumbexpand_encoding(immediate, 24);
-                        JIT_DEBUG_MESSAGE("thumbexpenc: %8x", imm_encoding);
-                        frag_instr32(
-                            0xf0400000
-                            | (bits(imm_encoding, 11, 1) << 26)
-                            | (reg_armidx(dst) << 16)
-                            | (bits(imm_encoding, 8, 3) << 12)
-                            | (reg_armidx(dst) << 8)
-                            | (bits(imm_encoding, 0, 8) << 0)
+                        frag_imm12c_rd8_rn16(
+                            0xf0400000, reg_armidx(dst), reg_armidx(dst), 0, immediate, 24
                         );
                     }
                 }
                 else
                 {
                     // and r%dst, $ff00
-                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    frag_instr32(
-                        0xf0000000
-                        | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 16)
-                        | (bits(imm_encoding, 8, 3) << 12)
-                        | (reg_armidx(dst) << 8)
-                        | (bits(imm_encoding, 0, 8) << 0)
+                    frag_imm12c_rd8_rn16(
+                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                     
                     // orr  r%dst, imm
@@ -864,71 +1276,11 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
             if (src == dst) return;
             else if (dst == OPARG_A)
             {
-                if (is_reghi(src))
-                {
-                    // lsrs r%dst, r%src, 8
-                    frag_instr16(
-                        0x0A00
-                        | (reg_armidx(dst) << 0)
-                        | (reg_armidx(src) << 3)
-                    );
-                }
-                else
-                {
-                    // movs r%dst, r%src
-                    frag_instr16(
-                        0x0000
-                        | (reg_armidx(dst) << 0)
-                        | (reg_armidx(src) << 3)
-                    );
-                    
-                    // uxtb r%dst, r%dst
-                    frag_instr16(
-                        0xB2C0
-                        | (reg_armidx(dst) << 3)
-                        | (reg_armidx(dst) << 0)
-                    );
-                }
+                
             }
             else if (src == OPARG_A)
             {
-                if (is_reghi(dst))
-                {
-                    // uxtb r%dst, r%dst
-                    frag_instr16(
-                        0xB2C0
-                        | (reg_armidx(dst) << 3)
-                        | (reg_armidx(dst) << 0)
-                    );
-                    
-                    // orr r%dst, r%dst, r%src, lsl #8
-                    frag_instr32(
-                        0xEA402000
-                        | (reg_armidx(dst) << 16)
-                        | (reg_armidx(dst) << 8)
-                        | (reg_armidx(src) << 0)
-                    );
-                }
-                else
-                {
-                    // and r%dst, $ff00
-                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    frag_instr32(
-                        0xf0000000
-                        | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 16)
-                        | (bits(imm_encoding, 8, 3) << 12)
-                        | (reg_armidx(dst) << 8)
-                        | (bits(imm_encoding, 0, 8) << 0)
-                    );
-                    
-                    // orr r%dst, r%src
-                    frag_instr16(
-                        0x4300
-                        | (reg_armidx(dst) << 0)
-                        | (reg_armidx(src) << 3)
-                    );
-                }
+                frag_store_reg8_rz(REG_A, dst);
             }
             else // neither operand is A
             {
@@ -936,30 +1288,32 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                 {
                     if (is_reghi(src))
                     {
-                        // lsrs r, r, $8
-                        frag_instr16(
-                            0x0A00
-                            | (reg_armidx(dst) << 3)
-                            | (reg_armidx(dst) << 0)
+                        // and r0, r%dst, #$ff00
+                        frag_instr32(
+                            0xf400407f
+                            | (reg_armidx(dst) << 16)
+                        );
+                        
+                        // orr r%dst, r0, r%dst, lsr #8
+                        frag_instr32(
+                            0xEA402010
+                            | (reg_armidx(dst) << 8)
                         );
                     }
                     else
                     {
-                        // uxtb r, r
+                        // uxtb r0, r%dst
                         frag_instr16(
                             0xB2C0
                             | (reg_armidx(dst) << 3)
-                            | (reg_armidx(dst) << 0)
+                        );
+                        
+                        // orr r%dst, r0, r%dst, lsl #8
+                        frag_instr32(
+                            0xEA402000
+                            | (reg_armidx(dst) << 8)
                         );
                     }
-                    
-                    // orr r, r, r, lsl #8
-                    frag_instr32(
-                        0xEA402000
-                        | (reg_armidx(dst) << 16)
-                        | (reg_armidx(dst) << 8)
-                        | (reg_armidx(src) << 0)
-                    );
                 }
                 else if (is_reghi(dst) && is_reghi(src))
                 {
@@ -971,17 +1325,11 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     );
                     
                     // push {r%src}
-                    frag_instr16((1 << reg_armidx(src)) | 0xb400);
+                    frag_armpush(1 << reg_armidx(src));
                     
                     // and r%src, $ff00
-                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    frag_instr32(
-                        0xf0000000
-                        | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(src) << 16)
-                        | (bits(imm_encoding, 8, 3) << 12)
-                        | (reg_armidx(src) << 8)
-                        | (bits(imm_encoding, 0, 8) << 0)
+                    frag_imm12c_rd8_rn16(
+                        0xf0000000, reg_armidx(src), reg_armidx(src), 0, 0xff, 24
                     );
                     
                     // orr r%dst, r%src
@@ -992,23 +1340,16 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     );
                     
                     // pop {r%src}
-                    frag_instr16((1 << reg_armidx(src)) | 0xbc00);
+                    frag_armpop(1 << reg_armidx(src));
                 }
                 else if (is_reglo(dst) && is_reglo(src))
                 {
                     // and r%dst, $ff00
-                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    frag_instr32(
-                        0xf0000000
-                        | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 16)
-                        | (bits(imm_encoding, 8, 3) << 12)
-                        | (reg_armidx(dst) << 8)
-                        | (bits(imm_encoding, 0, 8) << 0)
+                    frag_imm12c_rd8_rn16(
+                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                     
-                    // push {r%src}
-                    frag_instr16((1 << reg_armidx(src)) | 0xb400);
+                    frag_armpush(1 << reg_armidx(src));
                     
                     // uxtb r%src, r%src
                     frag_instr16(
@@ -1025,7 +1366,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     );
                     
                     // pop {r%src}
-                    frag_instr16((1 << reg_armidx(src)) | 0xbc00);
+                    frag_armpop(1 << reg_armidx(src));
                 }
                 else if (is_reghi(dst) && !is_reghi(src))
                 {
@@ -1047,27 +1388,16 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     
                     // OPTIMIZE -- can skip this if we know src's hi is 0.
                     // and r%dst, $ff00
-                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    frag_instr32(
-                        0xf0000000
-                        | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 16)
-                        | (bits(imm_encoding, 8, 3) << 12)
-                        | (reg_armidx(dst) << 8)
-                        | (bits(imm_encoding, 0, 8) << 0)
+                    frag_imm12c_rd8_rn16(
+                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                 }
                 else if (!is_reghi(dst) && is_reghi(src))
                 {
                     // and r%dst, $ff00
-                    unsigned imm_encoding = thumbexpand_encoding(0xff, 24);
-                    frag_instr32(
-                        0xf0000000
-                        | (bits(imm_encoding, 11, 1) << 26)
-                        | (reg_armidx(dst) << 16)
-                        | (bits(imm_encoding, 8, 3) << 12)
-                        | (reg_armidx(dst) << 8)
-                        | (bits(imm_encoding, 0, 8) << 0)
+                    // and r%src, $ff00
+                    frag_imm12c_rd8_rn16(
+                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                     
                     // orr r%dst, r%dst, r%src, lsr #8
@@ -1084,23 +1414,6 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         {
             assert(false);
         }
-    }
-    else if (src == OPARG_BCm || src == OPARG_DEm || src == OPARG_HLm)
-    {
-        dis.use_r_flex = 1;
-        
-        // push {...}
-        unsigned regs = used_registers() & 0xf & ~(1 << REG_FLEX);
-        if (regs) frag_instr16(regs | 0xb400);
-        
-        // movs r0, r%src
-        frag_instr16(0x0000 | (reg_armidx(src) << 3));
-        
-        // call read
-        frag_bl((fn_type)opts.read);
-        
-        // pop {...}
-        if (regs) frag_instr16(regs | 0xbc00);
     }
     else if (is_reg16(dst))
     {
@@ -1135,7 +1448,7 @@ static void frag_rotate(rotate_type rt, sm83_oparg_t dst)
 
 static void frag_swap(sm83_oparg_t dst)
 {
-    // TODO
+    assert(is_reg8(dst));
 }
 
 static void frag_jump(sm83_oparg_t condition, sm83_oparg_t addrmode)
@@ -1218,17 +1531,80 @@ static void frag_bit(unsigned b, sm83_oparg_t src)
 {
 }
 
-// v: 0 if clear, 1 if set.
-static void frag_set(unsigned b, sm83_oparg_t src, int v)
-{
-}
-
 static void frag_push(sm83_oparg_t src)
 {
+    use_register(src, 1, 0);
+    use_register(OPARG_SP, 1, 1);
+    
+    if (src == OPARG_AF)
+    {
+        // TODO
+        assert(false);
+    }
+    else if (is_reg16(src))
+    {
+        uint16_t regs = used_registers() & 0xe;
+        
+        frag_armpush(regs);
+        
+        // subs r%sp, 2 [T2]
+        frag_instr16(0x3802 | (REG_SP << 8));
+        
+        // mov r%sp, r1
+        frag_instr16(0x0000 | (reg_armidx(src) << 3) | 1);
+        
+        // uxth r%sp, r%sp
+        frag_instr16(0xb280 | (REG_SP << 3) | REG_SP);
+        
+        // mov r0, r%sp
+        frag_instr16(0x0000 | (REG_SP << 3));
+        
+        frag_bl((fn_type)opts.write);
+        
+        frag_armpop(regs);
+    }
+    else
+    {
+        assert(false);
+    }
 }
 
-static void frag_pop(sm83_oparg_t src)
+static void frag_pop(sm83_oparg_t dst)
 {
+    use_register(dst, 0, 1);
+    use_register(OPARG_SP, 1, 1);
+    
+    if (dst == OPARG_AF)
+    {
+        // TODO
+        assert(false);
+    }
+    else if (is_reg16(dst))
+    {
+        uint16_t regs = (used_registers() & ~(1 << reg_armidx(dst))) & 0xe;
+        
+        frag_armpush(regs);
+        
+        // mov r0, r%sp
+        frag_instr16(0x0000 | (REG_SP << 3));
+        
+        // adds r%sp, 2 [T2]
+        frag_instr16(0x3002 | (REG_SP << 8));
+        
+        // uxth r%sp, r%sp
+        frag_instr16(0xb280 | (REG_SP << 3) | REG_SP);
+        
+        frag_bl((fn_type)opts.read);
+        
+        frag_armpop(regs);
+        
+        // mov r%dst, r0
+        frag_instr16(0x0000 | reg_armidx(dst));
+    }
+    else
+    {
+        assert(false);
+    }
 }
 
 static int disassemble_done(void)
@@ -1412,10 +1788,10 @@ static void disassemble_instruction(void)
             return frag_jump(COND_nz, ADDR_r8);
             
         case 0x21:
-            return frag_ld(OPARG_HLmi, OPARG_A);
+            return frag_ld(OPARG_HL, OPARG_i16);
             
         case 0x22:
-            return frag_inc(OPARG_HL);
+            return frag_ld(OPARG_HLmi, OPARG_A);
             
         case 0x23:
             return frag_inc(OPARG_HL);
@@ -1696,7 +2072,7 @@ static void disassemble_instruction(void)
         case 0xEA:
             return frag_ld(OPARG_i16m, OPARG_A);
             
-        case 0xED:
+        case 0xEE:
             return frag_xor(OPARG_i8);
             
         case 0xEF:
@@ -1788,7 +2164,7 @@ static struct regfile_io_strategy_t get_regfile_io_strategy(void)
     uint32_t in = input_registers() & ~1;
     uint32_t out = dirty_registers() & ~1;
     
-    assert(REG_REGF == 0);
+    assert(REG_FLEX == 0);
     uint32_t would_be_clobbered_if_writesmear_loadsingle = ~(in | dirty_registers()) & SMEAR(out);
     uint32_t writesmear_waste = SMEAR(out) & ~out;
     uint32_t readsmear_waste = SMEAR(in | (SMEAR(out) & ~dirty_registers())) & ~out & ~in;
@@ -1825,6 +2201,8 @@ static struct regfile_io_strategy_t get_regfile_io_strategy(void)
     if (strat.ldtype == 2) strat.read_regs = SMEAR(strat.read_regs);
     if (strat.sttype == 2) strat.write_regs = SMEAR(strat.write_regs);
     
+    // TODO: mark any smeared registers as 'used'
+    
     return strat;
 }
 
@@ -1859,7 +2237,7 @@ static void disassemble_padding(void)
     
     if (dis.use_r_regfile)
     {
-        JIT_DEBUG_MESSAGE("r1 <- regfile: %8x", (uintptr_t)(void*)opts.regs);
+        JIT_DEBUG_MESSAGE("r%d <- regfile: %8x", REG_REGF, (uintptr_t)(void*)opts.regs);
         
         // movw r1, >&regfile
         uintptr_t regf_addr = (uintptr_t)(void*)opts.regs;
@@ -1881,12 +2259,6 @@ static void disassemble_padding(void)
             | (bits(regf_addr, 28, 4) << 16)
             | (REG_REGF << 8)
         );
-        
-        if (dis.use_r_flex)
-        {
-            // regfile is flex register, so we must store this for later.
-            prologue_16(0xb400 | REG_FLEX);
-        }
     }
     
     struct regfile_io_strategy_t strat = get_regfile_io_strategy();
@@ -1947,17 +2319,11 @@ static void disassemble_padding(void)
         }
         break;
     case 2:
-        // [A6.7.40] LDM r0, { ... }
+        // [A6.7.40] LDM r%regf, { ... }
         assert(strat.read_regs == SMEAR(strat.read_regs));
         prologue_16(
-            0xC800 | strat.read_regs
+            0xC800 | strat.read_regs | (REG_REGF << 8)
         );
-    }
-    
-    if (dis.use_r_regfile && dis.use_r_flex)
-    {
-        // regfile is flex register, so we must retrieve it as it's been clobbered
-        epilogue_16(0xbc00 | REG_FLEX);
     }
     
     switch (strat.sttype)
@@ -2025,28 +2391,17 @@ static void disassemble_padding(void)
         // mustn't clobber anything...
         assert (!(~(strat.read_regs | dirty_registers()) & strat.write_regs));
     
-        // STM r0, { ... }
+        // STM r%regf, { ... }
         epilogue_16(
-            0xC000 | strat.write_regs
+            0xC000 | strat.write_regs | (REG_REGF << 8)
         );
         break;
     }
     
     // pop {...}
-    if (reg_push && !dis.use_lr)
-    {
-        epilogue_16(0xbc00 | reg_push);
-    }
-    else if (reg_push && dis.use_lr)
-    {
-        epilogue_32(reg_push | 0xE8BD4000);
-    }
-    else if (dis.use_lr)
-    {
-        epilogue_32(0xF85DEB04);
-    }
+    frag_armpop(reg_push | (dis.use_lr << 14));
     
-    // return.
+    // ret
     epilogue_16(0x4770);
     
     assert(padc <= JIT_START_PADDING_ENTRY_C);
@@ -2093,24 +2448,25 @@ static void* disassemble_end(void)
     
     #ifdef JIT_DEBUG
     #define printf opts.playdate->system->logToConsole
-    JIT_DEBUG_MESSAGE("arm code: ");
+    //JIT_DEBUG_MESSAGE("arm code: ");
     const char* outmsg;
-    size_t armi = 0;
+    size_t fragi = 0;
     size_t armseek = 0;
     printf("Used: %02x; Dirty: %02x", used_registers(), dirty_registers());
     for (const uint16_t* arm = out; arm && arm < out+outsize;)
     {
         // zip along with arm disp as well
-        while (armseek < arm - out || (dis.frag[armi].length == 0 && armseek < outsize))
+        while (armseek < arm - out || (dis.frag[fragi].length == 0 && armseek < outsize))
         {
-            armseek += dis.frag[armi++].length;
+            armseek += dis.frag[fragi++].length;
         }
         
         if (armseek == arm - out)
         {
-            if (dis.frag[armi].romsrc)
+            if (dis.frag[fragi].romsrc)
             {
-                printf("\n; sm83: %02X", *dis.frag[armi].romsrc);
+                sm38d(dis.frag[fragi].romsrc, &outmsg);
+                printf("\n; %s", outmsg);
             }
         }
         const uint16_t* armprev = arm;
