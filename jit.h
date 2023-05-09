@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 
-typedef struct
+typedef struct jit_regfile_t
 {
     // we store as 32-bit instead of 16 for better alignment properties.
     uint32_t a;
@@ -12,6 +12,7 @@ typedef struct
     uint32_t de;
     uint32_t hl;
     uint32_t sp;
+    uint32_t carry;
     uint32_t pc;
 
 } jit_regfile_t;

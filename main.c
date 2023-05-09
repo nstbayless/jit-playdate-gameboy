@@ -140,7 +140,7 @@ void do_test(const uint8_t* rom)
 			spin();
 			playdate->system->logToConsole("(invoking.)\n");
 			spin();
-			fn();
+			fn(&regs);
 			playdate->system->logToConsole("Done.\n");
 			spin();
 			playdate->system->logToConsole("(Done.)\n");

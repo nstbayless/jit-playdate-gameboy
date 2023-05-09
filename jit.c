@@ -54,7 +54,6 @@
             - storing pc.
             - branching.
             - status flags
-            - often we push r1 when we don't need to (used_registers() | 2)
 */
 
 /*
@@ -119,6 +118,12 @@ typedef int bool;
 #define REG_DE REG_IDX(de)
 #define REG_HL REG_IDX(hl)
 #define REG_SP REG_IDX(sp)
+#define REG_Carry REG_IDX(carry)
+
+// all sm83 registers
+#define REGS_SM83 0xFE
+#define REGS_ALL 0xFF
+#define REGS_NONFLEX (REGS_ALL & ~1)
 
 #define offsetof_hi(a, b) (offsetof(a, b) + 1)
 
@@ -315,28 +320,6 @@ static struct {
 
     unsigned done : 1;
     unsigned error : 1;
-    
-    // registers in, registers used, and registers out (i.e. modified)
-    // if used: must push register if >= 4
-    // if input: must read the register at start of block
-    // if dirty: must write the register back to the regfile at the end of the block
-    unsigned use_r_a: 1;
-    unsigned input_r_a : 1;
-    unsigned dirty_r_a : 1;
-    unsigned use_r_bc: 1;
-    unsigned input_r_bc : 1;
-    unsigned dirty_r_bc : 1;
-    unsigned use_r_de: 1;
-    unsigned input_r_de : 1;
-    unsigned dirty_r_de : 1;
-    unsigned use_r_hl: 1;
-    unsigned input_r_hl : 1;
-    unsigned dirty_r_hl : 1;
-    unsigned use_r_sp: 1;
-    unsigned input_r_sp : 1;
-    unsigned dirty_r_sp : 1;
-    unsigned use_r_regfile : 1;
-    unsigned use_r_flex : 1;
     unsigned use_lr : 1;
 } dis;
 
@@ -441,84 +424,6 @@ static int reg_armidx(sm83_oparg_t reg)
     }
 }
 
-// reg must be one of OPARG_A, OPARG_BC, OPARG_DE, OPARG_HL.
-static void use_register(sm83_oparg_t reg, int dependency, int dirty)
-{
-    switch (reg)
-    {
-        case OPARG_AF:
-            // fallthrough
-        case OPARG_A:
-            if (dependency && !dis.use_r_a)
-            {
-                dis.input_r_a = 1;
-            }
-            if (dirty)
-            {
-                dis.dirty_r_a = 1;
-            }
-            dis.use_r_a = 1;
-            dis.use_r_regfile = 1;
-            break;
-        case OPARG_B:
-        case OPARG_C:
-        case OPARG_BC:
-            if (dependency && !dis.use_r_bc)
-            {
-                dis.input_r_bc = 1;
-            }
-            if (dirty)
-            {
-                dis.dirty_r_bc = 1;
-            }
-            dis.use_r_bc = 1;
-            dis.use_r_regfile = 1;
-            break;
-        case OPARG_D:
-        case OPARG_E:
-        case OPARG_DE:
-            if (dependency && !dis.use_r_de)
-            {
-                dis.input_r_de = 1;
-            }
-            if (dirty)
-            {
-                dis.dirty_r_de = 1;
-            }
-            dis.use_r_de = 1;
-            dis.use_r_regfile = 1;
-            break;
-        case OPARG_H:
-        case OPARG_L:
-        case OPARG_HL:
-            if (dependency && !dis.use_r_hl)
-            {
-                dis.input_r_hl = 1;
-            }
-            if (dirty)
-            {
-                dis.dirty_r_hl = 1;
-            }
-            dis.use_r_hl = 1;
-            dis.use_r_regfile = 1;
-            break;
-        case OPARG_SP:
-            if (dependency && !dis.use_r_sp)
-            {
-                dis.input_r_sp = 1;
-            }
-            if (dirty)
-            {
-                dis.dirty_r_sp = 1;
-            }
-            dis.use_r_sp = 1;
-            dis.use_r_regfile = 1;
-            break;
-        default:
-            break;
-    }
-}
-
 static uint32_t swap16_32(uint32_t a)
 {
     return ((a >> 16) & 0x0000ffff) | ((a << 16) & 0xffff0000);
@@ -569,89 +474,6 @@ static void frag_instr32(uint32_t instr)
         .args = (void*)(uintptr_t)instr,
         .produce = fasm_32
     );
-}
-
-static uint8_t input_registers(void)
-{
-    uint32_t reg_push = 0;
-    if (dis.input_r_a)
-    {
-        reg_push |= 1 << REG_A;
-    }
-    if (dis.input_r_bc)
-    {
-        reg_push |= 1 << REG_BC;
-    }
-    if (dis.input_r_de)
-    {
-        reg_push |= 1 << REG_DE;
-    }
-    if (dis.input_r_hl)
-    {
-        reg_push |= 1 << REG_HL;
-    }
-    if (dis.input_r_sp)
-    {
-        reg_push |= 1 << REG_SP;
-    }
-    return reg_push;
-}
-
-static uint8_t used_registers(void)
-{
-    uint32_t reg_push = 0;
-    if (dis.use_r_a)
-    {
-        reg_push |= 1 << REG_A;
-    }
-    if (dis.use_r_bc)
-    {
-        reg_push |= 1 << REG_BC;
-    }
-    if (dis.use_r_de)
-    {
-        reg_push |= 1 << REG_DE;
-    }
-    if (dis.use_r_hl)
-    {
-        reg_push |= 1 << REG_HL;
-    }
-    if (dis.use_r_sp)
-    {
-        reg_push |= 1 << REG_SP;
-    }
-    if (dis.use_r_regfile)
-    {
-        reg_push |= 1 << REG_REGF;
-    }
-    return reg_push;
-}
-
-static uint8_t dirty_registers(void)
-{
-    uint32_t reg_push = 0;
-    if (dis.dirty_r_a)
-    {
-        reg_push |= 1 << REG_A;
-    }
-    if (dis.dirty_r_bc)
-    {
-        reg_push |= 1 << REG_BC;
-    }
-    if (dis.dirty_r_de)
-    {
-        reg_push |= 1 << REG_DE;
-    }
-    if (dis.dirty_r_hl)
-    {
-        reg_push |= 1 << REG_HL;
-    }
-    if (dis.dirty_r_sp)
-    {
-        reg_push |= 1 << REG_SP;
-    }
-    reg_push |= 1 << REG_REGF;
-    return reg_push;
 }
 
 static uint32_t bitsmear_right(uint32_t b)
@@ -736,7 +558,7 @@ static uint8_t fasm_delegate(void* fn, uint16_t* outbuff)
     
     // only need to save registers r0-r3
     // registers r4+ are callee-saved
-    uint32_t reg_push = used_registers() & 0xF;
+    uint32_t reg_push = REGS_NONFLEX & 0xF;
     
     // push {...}
     if (reg_push)
@@ -773,12 +595,7 @@ static void frag_bl(fn_type fn)
     );
 }
 
-static void frag_set_n(void)
-{
-    // TODO
-}
-
-static void frag_clear_n(void)
+static void frag_set_n(int set)
 {
     // TODO
 }
@@ -855,6 +672,32 @@ static void frag_armpop(uint16_t regs)
     }
 }
 
+// results in r1-r3 pushed, and r0 containing the read of (hl)
+static void frag_pre_readwrite_hlm(void)
+{
+    assert(REG_HL >= 4); // need this to be able to copy hl to r0 for argument.
+    frag_armpush(REGS_NONFLEX & 0xf);
+    
+    // movs r0, r%hl
+    frag_instr16(0x0000 | (REG_HL << 3));
+    
+    frag_bl((fn_type)opts.read);
+}
+
+// writes r1 to (hl), then pops r1-r3.
+static void frag_post_readwrite_hlm(void)
+{
+    // movs r0, r%hl
+    frag_instr16(0x0000 | (REG_HL << 3));
+    
+    frag_bl((fn_type)opts.write);
+    
+    frag_armpop(REGS_NONFLEX & 0xF);
+    
+    // we have to stop if we write to rom.
+    if (!opts.fixed_bank) dis.done = 1;
+}
+
 static void frag_imm12c_rd8_rn16(
     uint32_t instruction,
     uint8_t rd,
@@ -888,33 +731,15 @@ static void frag_set(unsigned b, sm83_oparg_t dst, int v)
     
     if (dst == OPARG_HLm)
     {
-        use_register(dst, 1, 0);
-        dis.use_r_flex = 1;
-        
-        assert(REG_HL >= 4); // need this to be able to copy hl to r0 for argument.
-        frag_armpush((used_registers() | 2) & 0xe);
-        
-        // movs r0, r%hl
-        frag_instr16(0x0000 | (REG_HL << 3));
-        
-        frag_bl((fn_type)opts.read);
+        frag_pre_readwrite_hlm();
         
         // bic/orr r1,r0,#(1<<b)
         frag_imm12c_rd8_rn16(instruction, 0, 1, false, 1, 32-b);
         
-        // movs r0, r%hl
-        frag_instr16(0x0000 | (REG_HL << 3));
-        
-        frag_bl((fn_type)opts.write);
-        
-        frag_armpop((used_registers() | 2) & 0xe);
-        
-        // we have to stop if we write to rom.
-        if (!opts.fixed_bank) dis.done = 1;
+        frag_post_readwrite_hlm();
     }
     else if (is_reg8(dst))
     {
-        use_register(dst, 1, 1);
         if (is_reghi(dst))
         {
             frag_imm12c_rd8_rn16(instruction, reg_armidx(dst), reg_armidx(dst), false, 1, 24-b);
@@ -930,25 +755,121 @@ static void frag_set(unsigned b, sm83_oparg_t dst, int v)
     }
 }
 
+static void frag_incdec(sm83_oparg_t arg, bool dec)
+{
+    const uint16_t op = (dec)
+        ? 0x3801
+        : 0x3001;
+        
+    const uint32_t op32 = (dec)
+        ? 0xf1a00000
+        : 0xf5000000;
+    
+    if (is_reg16(arg))
+    {
+        // adds r%arg, 1 [T2]
+        frag_instr16(op | (reg_armidx(arg) << 8));
+        
+        // uxth r%arg, r%arg
+        frag_instr16(0xb280 | (reg_armidx(arg) << 3) | reg_armidx(arg));
+    }
+    else if (is_reg8(arg))
+    {
+        if (arg == OPARG_A)
+        {
+            // adds r%arg, 1 [T2]
+            frag_instr16(op | (reg_armidx(arg) << 8));
+            
+            // uxtb r%arg, r%arg
+            frag_instr16(
+                0xB2C0
+                | (reg_armidx(arg) << 3)
+                | (reg_armidx(arg) << 0)
+            );
+            
+            // TODO: znh
+        }
+        else if (is_reglo(arg))
+        {
+            // lsrs r0, r%arg,#8
+            frag_instr16(0x0a00 | (reg_armidx(arg) << 3) | (0 << 0));
+            
+            // adds r%arg, 1 [T2]
+            frag_instr16(op | (reg_armidx(arg) << 8));
+            
+            // uxtb r%arg, r%arg
+            frag_instr16(
+                0xB2C0
+                | (reg_armidx(arg) << 3)
+                | (reg_armidx(arg) << 0)
+            );
+            
+            // orr.w r%arg, r%arg, r0<<8
+            frag_instr32(
+                0xea402000
+                | (reg_armidx(arg) << 16)
+                | (reg_armidx(arg) << 8)
+                | (0 << 0)
+            );
+            
+            // TODO: znh
+        }
+        else if (is_reghi(arg))
+        {
+            // adds r%arg, r%arg, #$100
+            frag_imm12c_rd8_rn16(
+                op32, reg_armidx(arg), reg_armidx(arg), false, 0x1, 8
+            );
+            
+            // uxth r%arg, r%arg
+            frag_instr16(0xb280 | (reg_armidx(arg) << 3) | reg_armidx(arg));
+            
+            // TODO: znh
+        }
+        
+        frag_set_n(0);
+    }
+    else if (arg == OPARG_HLm)
+    {
+        // TODO
+        frag_pre_readwrite_hlm();
+        
+        // adds r0,r0,#1 [T2]
+        frag_instr16(op);
+        
+        // uxtb r1, r1
+        frag_instr16(
+            0xB2C0
+            | (0 << 3)
+            | (1 << 0)
+        );
+        
+        frag_post_readwrite_hlm();
+        
+        frag_set_n(0);
+    }
+    else
+    {
+        assert(false);
+    }
+}
+
 static void frag_inc(sm83_oparg_t arg)
 {
-    frag_clear_n();
-    // TODO
+    frag_incdec(arg, false);
 }
 
 static void frag_dec(sm83_oparg_t arg)
 {
-    frag_set_n();
-    // TODO
+    frag_incdec(arg, true);
 }
 
 // moves 16-bit immediate into the given register
 // no assumptions are made about the contents of dst
 static void frag_ld_imm16(int dstidx, uint16_t imm)
 {
-    #if 0
     // disabled because affecting the flags is scary.
-    if (im <= 0xff)
+    if (imm <= 0xff)
     {
         // MOVS r%dst, imm
         frag_instr16(
@@ -958,7 +879,6 @@ static void frag_ld_imm16(int dstidx, uint16_t imm)
         );
     }
     else
-    #endif
     {
         // MOVW r%dst, imm16 [T3]
         frag_instr32(
@@ -1095,9 +1015,6 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         return;
     }
     
-    use_register(src, 1, 0);
-    use_register(dst, 0, 1);
-    
     unsigned immediate = 0;
     if (src == OPARG_i8 || src == OPARG_i8m || src == OPARG_i8sp
         || dst == OPARG_i8 || dst == OPARG_i8m || dst == OPARG_i8sp)
@@ -1113,9 +1030,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         || src == OPARG_i16m || src == OPARG_i8m || src == OPARG_Cm)
     {
         assert(is_reg8(dst));
-        dis.use_r_flex = 1;
-        
-        unsigned regs = used_registers() & 0xe;
+        unsigned regs = REGS_NONFLEX & 0xF;
         
         // we can skip preserving A if we're going to write to it.
         if (dst == OPARG_A)
@@ -1165,20 +1080,18 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
     )
     {
         assert(is_reg8(src));
-        dis.use_r_flex = 1;
-        
         // FIXME: frag_push/frag_pop should be its own instruction, because
         // if we clobber r1 and it's smear-written later... aaahh...
         // well, we always push r1 as a result, but that isn't *always* needed!
         
-        frag_armpush((used_registers() | 2) & 0xe);
+        frag_armpush(REGS_NONFLEX & 0xF);
         
         switch (dst)
         {
         case OPARG_BCm:
         case OPARG_DEm:
         case OPARG_HLm:
-            // movs r0, r%src
+            // movs r0, r%dst
             frag_instr16(0x0000 | (reg_armidx(dst) << 3));
             break;
         case OPARG_i8m:
@@ -1211,7 +1124,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         frag_bl((fn_type)opts.write);
         
         // pop {...}
-        frag_armpop((used_registers() | 2) & 0xe);
+        frag_armpop(REGS_NONFLEX & 0xF);
         
         // we have to stop now because of the possibility of a bankswap under our feet.
         if (!(dst == OPARG_i16m && sm83_addr_safe_write(immediate))
@@ -1276,7 +1189,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
             if (src == dst) return;
             else if (dst == OPARG_A)
             {
-                
+                frag_store_rz_reg8(REG_A, src);
             }
             else if (src == OPARG_A)
             {
@@ -1532,10 +1445,7 @@ static void frag_bit(unsigned b, sm83_oparg_t src)
 }
 
 static void frag_push(sm83_oparg_t src)
-{
-    use_register(src, 1, 0);
-    use_register(OPARG_SP, 1, 1);
-    
+{   
     if (src == OPARG_AF)
     {
         // TODO
@@ -1543,7 +1453,7 @@ static void frag_push(sm83_oparg_t src)
     }
     else if (is_reg16(src))
     {
-        uint16_t regs = used_registers() & 0xe;
+        uint16_t regs = REGS_NONFLEX & 0xF;
         
         frag_armpush(regs);
         
@@ -1571,9 +1481,6 @@ static void frag_push(sm83_oparg_t src)
 
 static void frag_pop(sm83_oparg_t dst)
 {
-    use_register(dst, 0, 1);
-    use_register(OPARG_SP, 1, 1);
-    
     if (dst == OPARG_AF)
     {
         // TODO
@@ -1581,7 +1488,7 @@ static void frag_pop(sm83_oparg_t dst)
     }
     else if (is_reg16(dst))
     {
-        uint16_t regs = (used_registers() & ~(1 << reg_armidx(dst))) & 0xe;
+        uint16_t regs = (REGS_NONFLEX & ~(1 << reg_armidx(dst))) & 0xf;
         
         frag_armpush(regs);
         
@@ -1631,7 +1538,6 @@ static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, 
             .produce = fasm_skip
         );
     }
-    dis.use_r_a = 1;
     dis.fragc = JIT_START_PADDING_ENTRY_C;
     dis.rom = (const uint8_t*)opts.rom + gb_rom_offset;
     dis.romend = (const uint8_t*)opts.rom + gb_end_offset;
@@ -2123,89 +2029,6 @@ static void disassemble_instruction(void)
     }
 }
 
-// these next two functions are estimates / heuristics
-// feel free to reimplement them.
-
-struct regfile_io_strategy_t {
-    uint16_t read_regs;
-    uint16_t write_regs;
-    
-    // 0 if no registers accessed
-    // 1 to access individually
-    // 2 for load/store multiple
-    int ldtype;
-    int sttype;
-};
-
-#define SMEAR(a) (bitsmear_right(a) & ~1)
-
-static int access_strategy_for_bits(uint16_t regs)
-{
-    uint32_t smearwaste = __builtin_popcount(SMEAR(regs) & ~(regs|1));
-    switch (__builtin_popcount(regs))
-    {
-    case 0:
-        return 0;
-    case 1:
-        return 1;
-    case 2:
-        return 1 + (smearwaste <= 1);
-    case 3:
-        return 1 + (smearwaste <= 3);
-    default:
-        return 2;
-    }
-    return 2;
-}
-
-static struct regfile_io_strategy_t get_regfile_io_strategy(void)
-{
-    struct regfile_io_strategy_t strat;
-    uint32_t in = input_registers() & ~1;
-    uint32_t out = dirty_registers() & ~1;
-    
-    assert(REG_FLEX == 0);
-    uint32_t would_be_clobbered_if_writesmear_loadsingle = ~(in | dirty_registers()) & SMEAR(out);
-    uint32_t writesmear_waste = SMEAR(out) & ~out;
-    uint32_t readsmear_waste = SMEAR(in | (SMEAR(out) & ~dirty_registers())) & ~out & ~in;
-    
-    // should use cycle counting to calculate these weights
-    int smear_advantage =
-        __builtin_popcount(out)
-        - __builtin_popcount(writesmear_waste)
-        + __builtin_popcount(in)
-        - __builtin_popcount(readsmear_waste) * 2;
-    
-    if (smear_advantage > 0)
-    {
-        // force load the non-dirty smeared out registers
-        in |= SMEAR(out) & ~dirty_registers();
-    }
-    
-    strat.ldtype = access_strategy_for_bits(in);
-    strat.sttype = access_strategy_for_bits(out);
-    
-    // regardless of above reimplementation, the following must hold because
-    // it satisfies important invariants regarding ldm/stm sequentiality.
-    
-    if (strat.sttype == 2)
-    {
-        if (~(in | dirty_registers()) & SMEAR(out))
-        {
-            strat.sttype = 1;
-        }
-    }
-    
-    strat.read_regs = in;
-    strat.write_regs = out;
-    if (strat.ldtype == 2) strat.read_regs = SMEAR(strat.read_regs);
-    if (strat.sttype == 2) strat.write_regs = SMEAR(strat.write_regs);
-    
-    // TODO: mark any smeared registers as 'used'
-    
-    return strat;
-}
-
 static void disassemble_padding(void)
 {
     // add some extra code at the start/end of a jit block
@@ -2225,7 +2048,7 @@ static void disassemble_padding(void)
     size_t padc = 0;
     
     // we have to push r4-r7 if we use them -- they are callee-push registers.
-    uint32_t reg_push = used_registers() & ~0xf;
+    uint32_t reg_push = REGS_ALL & ~0xf;
     if (reg_push && ! dis.use_lr)
     {
         prologue_16(0xb400 | reg_push);
@@ -2235,168 +2058,18 @@ static void disassemble_padding(void)
         prologue_16(0xb500 | reg_push);
     }
     
-    if (dis.use_r_regfile)
-    {
-        JIT_DEBUG_MESSAGE("r%d <- regfile: %8x", REG_REGF, (uintptr_t)(void*)opts.regs);
-        
-        // movw r1, >&regfile
-        uintptr_t regf_addr = (uintptr_t)(void*)opts.regs;
-        prologue_32(
-            0xF2400000
-            | (bits(regf_addr, 0, 8)  << 0)
-            | (bits(regf_addr, 8, 3)  << 12)
-            | (bits(regf_addr, 11, 1) << 26)
-            | (bits(regf_addr, 12, 4) << 16)
-            | (REG_REGF << 8)
-        );
-        
-        // movt r1, <&regfile
-        prologue_32(
-            0xF2C00000
-            | (bits(regf_addr, 16, 8)  << 0)
-            | (bits(regf_addr, 24, 3)  << 12)
-            | (bits(regf_addr, 27, 1) << 26)
-            | (bits(regf_addr, 28, 4) << 16)
-            | (REG_REGF << 8)
-        );
-    }
+    // [A6.7.40] LDM r0, { ... }
+    prologue_16(
+        0xC800 | REGS_SM83 | (0 << 8)
+    );
     
-    struct regfile_io_strategy_t strat = get_regfile_io_strategy();
+    // movs r%regf, r%0
+    frag_instr16(0x0000 | (0 << 3) | (REG_REGF << 0));
     
-    switch (strat.ldtype)
-    {
-    case 0:
-        break;
-    case 1:
-        if (strat.read_regs & (1 << REG_A))
-        {
-            prologue_16(
-                0x6800
-                | (offsetof(jit_regfile_t, a) << 6)
-                | (REG_REGF << 3)
-                | (REG_A << 0)
-            );
-        }
-        
-        if (strat.read_regs & (1 << REG_BC))
-        {
-            prologue_16(
-                0x8800
-                | (offsetof(jit_regfile_t, bc) << 5)
-                | (REG_REGF << 3)
-                | (REG_BC << 0)
-            );
-        }
-        
-        if (strat.read_regs & (1 << REG_DE))
-        {
-            prologue_16(
-                0x8800
-                | (offsetof(jit_regfile_t, de) << 5)
-                | (REG_REGF << 3)
-                | (REG_DE << 0)
-            );
-        }
-        
-        if (strat.read_regs & (1 << REG_HL))
-        {
-            prologue_16(
-                0x8800
-                | (offsetof(jit_regfile_t, hl) << 5)
-                | (REG_REGF << 3)
-                | (REG_HL << 0)
-            );
-        }
-        
-        if (strat.read_regs & (1 << REG_SP))
-        {
-            prologue_16(
-                0x8800
-                | (offsetof(jit_regfile_t, sp) << 5)
-                | (REG_REGF << 3)
-                | (REG_SP << 0)
-            );
-        }
-        break;
-    case 2:
-        // [A6.7.40] LDM r%regf, { ... }
-        assert(strat.read_regs == SMEAR(strat.read_regs));
-        prologue_16(
-            0xC800 | strat.read_regs | (REG_REGF << 8)
-        );
-    }
-    
-    switch (strat.sttype)
-    {
-    case 0: // no write/read necessary.
-        break;
-    case 1: // write individually
-        if (strat.write_regs & (1 << REG_A))
-        {
-            // write value of A back to regfile
-            // strb r%a, [r%regf, offsetof(jit_regfile, a)]
-            epilogue_16(
-                0x7000
-                | ((offsetof(jit_regfile_t, a) / sizeof(uint32_t)) << 6)
-                | (REG_REGF << 3)
-                | (REG_A << 0)
-            );
-        }
-        
-        if (strat.write_regs & (1 << REG_BC))
-        {
-            // strh r%bc, [r%regf, offsetof(jit_regfile, bc)]
-            epilogue_16(
-                0x8000
-                | ((offsetof(jit_regfile_t, bc)/2) << 6)
-                | (REG_REGF << 3)
-                | (REG_BC << 0)
-            );
-        }
-        
-        if (strat.write_regs & (1 << REG_DE))
-        {
-            epilogue_16(
-                0x8000
-                | ((offsetof(jit_regfile_t, de)/2) << 6)
-                | (REG_REGF << 3)
-                | (REG_DE << 0)
-            );
-        }
-        
-        if (strat.write_regs & (1 << REG_HL))
-        {
-            epilogue_16(
-                0x8000
-                | ((offsetof(jit_regfile_t, hl)/2) << 6)
-                | (REG_REGF << 3)
-                | (REG_HL << 0)
-            );
-        }
-        
-        if (strat.write_regs & (1 << REG_SP))
-        {
-            epilogue_16(
-                0x8000
-                | ((offsetof(jit_regfile_t, sp)/2) << 6)
-                | (REG_REGF << 3)
-                | (REG_SP << 0)
-            );
-        }
-        break;
-    case 2: // we can use the store-multiple instruction
-    
-        assert(strat.write_regs == SMEAR(strat.write_regs));
-        
-        // mustn't clobber anything...
-        assert (!(~(strat.read_regs | dirty_registers()) & strat.write_regs));
-    
-        // STM r%regf, { ... }
-        epilogue_16(
-            0xC000 | strat.write_regs | (REG_REGF << 8)
-        );
-        break;
-    }
+    // STM r%regf, { ... }
+    epilogue_16(
+        0xC000 | REGS_SM83 | (REG_REGF << 8)
+    );
     
     // pop {...}
     frag_armpop(reg_push | (dis.use_lr << 14));
@@ -2452,7 +2125,6 @@ static void* disassemble_end(void)
     const char* outmsg;
     size_t fragi = 0;
     size_t armseek = 0;
-    printf("Used: %02x; Dirty: %02x", used_registers(), dirty_registers());
     for (const uint16_t* arm = out; arm && arm < out+outsize;)
     {
         // zip along with arm disp as well
