@@ -2017,6 +2017,10 @@ static void frag_daa(void)
     const uint8_t regs = (REGS_NONFLEX & ~(1 << REG_A)) & 0xe;
     frag_armpush(regs);
     
+    frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, REG_NH);
+    assert(REG_A == 1);
+    frag_instr16_rd0_rm3(THUMB16_MOV_REG, 2, REG_Carry);
+    
     frag_bl((fn_type)jit_regfile_daa);
     
     #if SETFLAGS
