@@ -2,7 +2,7 @@
 
 #include "pd_api.h"
 #include <stdint.h>
-
+#include <stdbool.h>
 
 #define JIT_ZNH_BIT_N 5
 typedef struct jit_regfile_t
@@ -13,6 +13,8 @@ typedef struct jit_regfile_t
     uint32_t de;
     uint32_t hl;
     uint32_t sp;
+    
+    // bit 0 is 1 iff carry is set
     uint32_t carry;
     
     // 0 if set
@@ -21,28 +23,46 @@ typedef struct jit_regfile_t
     
     // bit 0: garbage (could be 0 or 1)
     // bit 5: n
-    // byte 1: c
-    // byte 2: operand a
-    // byte 3: operand b
+    // byte 1: c (in addition to 0 and 1, can also be 0x10; if c is 0x10 and a and b are 0, then h is set.)
+    // byte 2: operand b
+    // byte 3: operand a
     // h is implicit: it is 1 if (a&0xf+b&xf+c)&0x10
     uint32_t nh;
 
     uint32_t pc;
+    uint32_t ime;
 } jit_regfile_t;
 
-static inline int jit_regfile_getn(uint32_t znh)
+static inline bool jit_regfile_getn(uint32_t nh)
 {
-    return (znh >> 5) & 1;
+    return (nh >> 5) & 1;
 }
 
-static inline int jit_regfile_geth(uint32_t znh)
+static inline bool jit_regfile_geth(uint32_t nh)
 {
     uint8_t c = (znh >> 8) & 0xff;
-    uint8_t a = (znh >> 16) & 0x0f;
-    uint8_t b = (znh >> 24) & 0x0f;
-    
-    // OPTIMIZE: shift to php z register...
-    return !!((a + b + c) & 0x10);
+    uint8_t b = (znh >> 16) & 0x0f;
+    uint8_t a = (znh >> 24) & 0x0f;
+    int n = jit_regfile_getn(nh);
+    if (!n)
+    {
+        return !!((a + b + c) & 0x10);
+    }
+    else
+    {
+        return !!((a - b - c) & 0x10);
+    }
+}
+
+static inline uint8_t jit_regfile_get_f(uint32_t carry, uint32_t z, uint32_t nh)
+{
+    return ((!z) << 7) | (carry << 4) | jit_regfile_geth(nh) << 5 | (jit_regfile_getn(nh) << 6);
+}
+
+// can assign the result to the .nh field.
+static inline uint32_t jit_regfile_setnh(bool n, bool h)
+{
+    return (n << 5) | (h << 12);
 }
 
 typedef void (*jit_fn)(jit_regfile_t*);

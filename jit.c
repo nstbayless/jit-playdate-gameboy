@@ -126,28 +126,41 @@ typedef int bool;
 #define REG_HL REG_IDX(hl)
 #define REG_SP REG_IDX(sp)
 #define REG_Carry REG_IDX(carry)
-#define REG_Z REG_IDX(z)
-#define REG_NH REG_IDX(nh)
+#define REG_nZ REG_IDX(z) /* complement of sm83 z flag; is 0 iff sm83 z is set. */
+#define REG_NH REG_IDX(nh) /* N and H flags; see jit.h */
 
 // [sic], same opcode, but lsl has non-zero immediate
 #define THUMB16_MOV_REG 0x0000
+#define THUMB16_ADD_REG_T1 0x1800 /* rd0_rn3_rm6 */
+#define THUMB16_SUB_REG 0x1A00 /* rd0_rn3_rm6 */
+#define THUMB16_ADD_3   0x1C00
+#define THUMB16_SUB_3   0x1E00
 #define THUMB16_LSL_IMM 0x0000
 #define THUMB16_LSR_IMM 0x0800
 #define THUMB16_ASR_IMM 0x1000
+#define THUMB16_ADD_8   0x3000
+#define THUMB16_SUB_8   0x3800
 #define THUMB16_ORR_REG 0x4300
+#define THUMB16_ADD_REG_T2 0x4400 /* rdn0127_rm_3456 */
+#define THUMB16_UXTH    0xB280
 #define THUMB16_UXTB    0xB2C0
 
+#define THUMB32_ADD_REG 0xeb000000
+#define THUMB32_SUB_REG 0xeba00000
 #define THUMB32_AND_IMM 0xf0000000
 #define THUMB32_BIC_IMM 0xf0200000
 #define THUMB32_ORR_IMM 0xf0400000
 #define THUMB32_ORN_IMM 0xf0600000
 #define THUMB32_EOR_IMM 0xf0800000
 #define THUMB32_ADD_IMM_T3 0xf1000000
+#define THUMB32_ADD_IMM_T4 0xf2000000
+#define THUMB32_SUB_IMM_T3 0xf1A00000
+#define THUMB32_SUB_IMM_T4 0xf2A00000
 
 #define THUMB32_ORR_REG 0xea400000
 
 // all sm83 registers
-#define REGS_SM83 (REG_A | REG_BC | REG_DE | REG_HL | REG_SP | REG_Carry | REG_Z | REG_NH)
+#define REGS_SM83 (REG_A | REG_BC | REG_DE | REG_HL | REG_SP | REG_Carry | REG_nZ | REG_NH)
 #define REGS_ALL (REGS_SM83 | 1)
 #define REGS_NONFLEX (REGS_ALL & ~1)
 
@@ -697,6 +710,7 @@ static void frag_pre_readwrite_hlm(void)
 static void frag_read_hlm(void)
 {
     assert(REG_HL >= 4); // need this to be able to copy hl to r0 for argument.
+    assert (! (REGS_NONFLEX & 0x1));
     frag_armpush(REGS_NONFLEX & 0xf);
     
     // movs r0, r%hl
@@ -731,6 +745,33 @@ static void frag_instr16_rd0_rm3(
     assert( rm == (rm & 0x7) );
     frag_instr16(
         instruction | rd | (rm << 3)
+    );
+}
+
+static void frag_add_rd_rn(
+    uint8_t rdn, uint8_t rm
+);
+{
+    frag_instr16(
+        THUMB16_ADD_REG_T2
+        | (rm << 4)
+        | (bits(rdn, 0, 3))
+        | (bit(rdn, 3) << 7)
+    );
+}
+
+static void frag_instr16_rd0_rn3_rm6(
+    uint16_t instruction,
+    uint8_t rd,
+    uint8_t rn,
+    uint8_t rm
+)
+{
+    assert( rd == (rd & 0x7) );
+    assert( rn == (rn & 0x7) );
+    assert( rm == (rm & 0x7) );
+    frag_instr16(
+        instruction | rd | (rn << 3) | (rm << 6)
     );
 }
 
@@ -1003,9 +1044,9 @@ static void frag_incdec(sm83_oparg_t arg, bool dec)
             
             #if SETFLAGS
             frag_imm12c_rd8_rn16(
-                THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+                THUMB32_ORR_IMM, REG_NH, REG_NH, false, 0x10 + dec, 28
             );
-            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_Z, REG_A);
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_nZ, REG_A);
             #endif
         }
         else if (is_reglo(arg))
@@ -1046,9 +1087,9 @@ static void frag_incdec(sm83_oparg_t arg, bool dec)
             
             #if SETFLAGS
             frag_imm12c_rd8_rn16(
-                THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+                THUMB32_ORR_IMM, REG_NH, REG_NH, false, 0x10 + dec, 28
             );
-            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_Z, REG_A);
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_nZ, REG_A);
             #endif
             
             // orr.w r%arg, r%arg, r0<<8
@@ -1093,20 +1134,18 @@ static void frag_incdec(sm83_oparg_t arg, bool dec)
             // uxth r%arg, r%arg
             frag_instr16(0xb280 | (reg_armidx(arg) << 3) | reg_armidx(arg));
             
-            // TODO: nh
-            
             #if SETFLAGS
             if (dec)
             {
                 frag_instr16_rd0_rm3_imm5(
-                    THUMB16_LSL_IMM, REG_NH, REG_NH, 16
+                    THUMB16_LSL_IMM, REG_NH, REG_NH, 24
                 );
             }
             frag_instr16_rd0_rm3_imm5(
-                THUMB16_LSR_IMM, REG_Z, reg_armidx(arg), 8
+                THUMB16_LSR_IMM, REG_nZ, reg_armidx(arg), 8
             );
             frag_imm12c_rd8_rn16(
-                THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+                THUMB32_ORR_IMM, REG_NH, REG_NH, false, 0x10 + dec, 28
             );
             #endif
         }
@@ -1136,19 +1175,17 @@ static void frag_incdec(sm83_oparg_t arg, bool dec)
         }
         #endif
         
-        // uxtb r1, r1
-        frag_instr16(
-            0xB2C0
-            | (0 << 3)
-            | (1 << 0)
+        // uxtb r1, r0
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, 1, 0
         );
         
         #if SETFLAGS
-        frag_instr16_rd0_rm3_imm5(
-            THUMB16_LSR_IMM, REG_Z, 0, 8
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, REG_nZ, 0
         );
         frag_imm12c_rd8_rn16(
-            THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+            THUMB32_ORR_IMM, REG_NH, REG_NH, false, 0x10 + dec, 28
         );
         #endif
         
@@ -1726,7 +1763,7 @@ static void frag_rotate_helper(rotate_type rt, uint8_t regdst, uint8_t reg, uint
     if (setz)
     {
         frag_instr16_rd0_rm3(
-            THUMB16_MOV_REG, REG_Z, regdst
+            THUMB16_MOV_REG, REG_nZ, regdst
         );
     }
 }
@@ -1739,7 +1776,6 @@ static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
     {
         frag_pre_readwrite_hlm();
     }
-    
     
     uint8_t carry_in = REG_Carry;
     const uint8_t carry_out = REG_Carry;
@@ -1846,7 +1882,7 @@ static void frag_swap(sm83_oparg_t dst)
         #if SETFLAGS
         // f: z=*
         frag_instr16_rd0_rm3(
-            THUMB16_MOV_REG, REG_Z, REG_A
+            THUMB16_MOV_REG, REG_nZ, REG_A
         );
         #endif
     }
@@ -1856,11 +1892,11 @@ static void frag_swap(sm83_oparg_t dst)
         frag_ubfx(0, reg_armidx(dst), 4, 4);
         
         frag_instr16_rd0_rm3_imm5(
-            THUMB16_LSL_IMM, REG_Z, reg_armidx(dst), 4
+            THUMB16_LSL_IMM, REG_nZ, reg_armidx(dst), 4
         );
         
         frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, REG_Z, 0
+            THUMB16_ORR_REG, REG_nZ, 0
         );
         
         // zero-out low byte
@@ -1869,11 +1905,11 @@ static void frag_swap(sm83_oparg_t dst)
         );
         
         frag_instr16_rd0_rm3(
-            THUMB16_UXTB, REG_Z, REG_Z
+            THUMB16_UXTB, REG_nZ, REG_nZ
         );
         
         frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, reg_armidx(dst), REG_Z
+            THUMB16_ORR_REG, reg_armidx(dst), REG_nZ
         );
         
         // z=* (already done, for free)
@@ -1883,27 +1919,27 @@ static void frag_swap(sm83_oparg_t dst)
         // TODO: optimize
         frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, 0, reg_armidx(dst), 4);
         
-        frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_Z, reg_armidx(dst), 4);
+        frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_nZ, reg_armidx(dst), 4);
         
         frag_instr16_rd0_rm3(
             THUMB16_UXTB, reg_armidx(dst), reg_armidx(dst)
         );
         
         frag_imm12c_rd8_rn16(
-            THUMB32_AND_IMM, REG_Z, REG_Z, false, 0xf0, 24
+            THUMB32_AND_IMM, REG_nZ, REG_nZ, false, 0xf0, 24
         );
         
         frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, REG_Z, 0
+            THUMB16_ORR_REG, REG_nZ, 0
         );
         
         // zero-out low byte
         frag_imm12c_rd8_rn16(
-            THUMB32_AND_IMM, REG_Z, REG_Z, false, 0xff, 24
+            THUMB32_AND_IMM, REG_nZ, REG_nZ, false, 0xff, 24
         );
         
         frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, reg_armidx(dst), REG_Z
+            THUMB16_ORR_REG, reg_armidx(dst), REG_nZ
         );
     }
     else if (dst == OPARG_HLm)
@@ -1932,7 +1968,7 @@ static void frag_swap(sm83_oparg_t dst)
         #if SETFLAGS
         // f: z=*
         frag_instr16_rd0_rm3(
-            THUMB16_MOV_REG, REG_Z, 1
+            THUMB16_MOV_REG, REG_nZ, 1
         );
         #endif
         
@@ -2002,36 +2038,546 @@ static void frag_ccf(void)
     #endif
 }
 
-static void frag_di(void)
+static void frag_edi(bool enable)
 {
+    frag_ld_imm16(0, enable);
+    
+    // str r0, [r%regf,#...]
+    frag_instr16_rd0_rm3_imm5(
+        0x6000,
+        0,
+        REG_REGF,
+        offsetof(jit_regfile_t, ime) >> 2
+    );
 }
 
-static void frag_ei(void)
+typedef enum
 {
+    AND,
+    OR,
+    XOR,
+    ADD,
+    ADC,
+    CP,
+    SUB,
+    SBC,
+} arithop_t;
+
+static void frag_bitwise(sm83_oparg_t src, arithop_t arithop)
+{
+    uint8_t op16 = THUMB16_ORR_REG;
+    uint8_t op32 = THUMB32_ORR_REG;
+    uint8_t op32imm = THUMB32_ORR_IMM;
+    
+    if (arithop == AND)
+    {
+        op16 = THUMB16_AND_REG;
+        op32 = THUMB32_AND_REG;
+        op32imm = THUMB32_AND_IMM;
+    }
+    
+    if (arithop == XOR)
+    {
+        op16 = THUMB16_EOR_REG;
+        op32 = THUMB32_EOR_REG;
+        op32imm = THUMB32_EOR_IMM;
+    }
+    
+    const uint8_t reg = reg_armidx(src);
+    if (src == OPARG_A)
+    {
+    src_a:
+        switch(arithop)
+        {
+        case AND:
+            #if SETFLAGS
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_nZ, REG_A);
+            #endif
+            break;
+            
+        case OR:
+            #if SETFLAGS
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_nZ, REG_A);
+            #endif
+            break;
+            
+        case XOR:
+            frag_ld_imm16(REG_A, 0);
+            #if SETFLAGS
+            frag_ld_imm16(REG_nZ, 0);
+            #endif
+            break;
+        }
+    }
+    else if (src == OPARG_i8)
+    {
+        const uint8_t immediate = sm83_next_byte();
+        
+        // shortcuts
+        if (immediate == 0xff && arithop == AND) goto src_a;
+        else if (immediate == 0x00 && arithop != AND)
+        {
+            arithop = OR;
+            goto src_a;
+        }
+        
+        // the main event
+        frag_imm12c_rd8_rn16(
+            op32imm, REG_A, REG_A, false, immediate, 0
+        );
+        
+        #if SETFLAGS
+        frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_nZ, REG_A);
+        #endif
+    }
+    else if (src == OPARG_HLm)
+    {
+        frag_read_hlm();
+        
+        frag_instr16_rd0_rm3(
+            op16, REG_A, 0
+        );
+        
+        #if SETFLAGS
+        frag_ld_imm16(REG_nZ, REG_A)
+        #endif
+    }
+    else if (is_reglo(src))
+    {
+        frag_instr16_rd0_rm3(
+            op16, REG_A, reg
+        );
+        
+        #if SETFLAGS
+        frag_instr16_rd0_rm3(
+            (arithop == AND) ? THUMB16_UXTB : THUMB16_MOV_REG, REG_nZ, REG_A
+        );
+        #endif
+        
+        if (arithop != AND)
+        {
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, REG_A, REG_A
+            );
+        }
+    }
+    else if (is_reghi(src))
+    {
+        frag_rd8_rn16_rm0_shift(
+            op32, REG_A, REG_A, reg, IMM_SHIFT_LSR, 8
+        );
+        
+        #if SETFLAGS
+        frag_ld_imm16(REG_nZ, REG_A)
+        #endif
+    }
+    else
+    {
+        // TODO: immediate
+        assert(false);
+    }
+    
+    #if SETFLAGS
+    switch (arith)
+    {
+    case AND:
+        frag_set_nh(0, 1);
+        break;
+        
+    case OR:
+    case XOR:
+        frag_set_nh(0, 0);
+        break;
+    
+    default:
+        break;
+    }
+    #endif
+}
+
+static void frag_arithmetic(sm83_oparg_t dst, sm83_oparg_t src, arithop_t arithop)
+{
+    const bool carry_in = (arithop == ADC || arithop == SBC);
+    const bool subtract = (arithop == SUB || arithop == SBC || arithop == CP);
+    if (carry_in)
+    {
+        // optimization: we could set the (arm) carry bit flag here to the value in REG_C
+        // then we can use the adc/sbc operations.
+    }
+    
+    #if SETFLAGS
+    // note: h flag will be modified further later.
+    frag_set_nh(subtract, 0);
+    #else
+    if (arithop == CP) return;
+    #endif
+    
+    const uint8_t dstreg = (arithop == CP)
+        ? REG_nZ
+        : REG_A;
+    
+    if (dst == OPARG_A)
+    {
+        if (src == OPARG_i8m)
+        {
+            immediate = sm83_next_byte();
+            // note: we can't replace with inc/dec if immediate is 1, because flags are different.
+            
+            const uint16_t op16_3 = (subtract)
+                ? THUMB16_SUB_3
+                : THUMB16_ADD_3;
+            
+            const uint16_t op16_8 = (subtract)
+                ? THUMB16_SUB_8
+                : THUMB16_ADD_8;
+                
+            const uint16_t op32_8 = (subtract)
+                ? THUMB32_ADD_IMM_T3
+                : THUMB32_SUB_IMM_T3;
+                
+            #if SETFLAGS
+            // nh[3] <- REG_A
+            frag_rd8_rn16_rm0_shift(
+                THUMB32_ORR_REG, REG_NH, REG_NH, REG_A, IMM_SHIFT_LSL, 24
+            );
+            #endif
+            
+            if (immediate == immediate & 0b111)
+            {
+                // use op 3
+                frag_instr16_rd0_rm3(
+                    op16_3 | (imm << 6),
+                    dstreg, REG_A
+                );
+            }
+            else if (dstreg == REG_A)
+            {
+                frag_instr16(
+                    op16_8 | (REG_A << 8) | immediate
+                );
+            }
+            else
+            {
+                frag_imm12c_rd8_rn16(
+                    op32_8, dstreg, REG_A, false, immediate, 0
+                );
+            }
+            
+            if (carry_in)
+            {
+                #if SETFLAGS
+                // nh[1] <- carry in
+                frag_rd8_rn16_rm0_shift(
+                    THUMB32_ORR_REG, REG_NH, REG_NH, REG_Carry, IMM_SHIFT_LSL, 8
+                );
+                #endif
+                
+                // r%a += c
+                frag_instr16_rd0_rn3_rm6(THUMB16_ADD_REG_T1, REG_A, REG_A, REG_Carry);
+            }
+            
+            #if SETFLAGS
+            // c <- carry out
+            frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_Carry, dstreg, 8);
+            
+            // nh[2] <- imm
+            frag_imm12c_rd8_rn16(
+                THUMB32_ORR_IMM,
+                REG_NH, REG_NH, false, imm, 16
+            );
+            
+            if (dstreg != REG_nZ)
+            {
+                // !z <- r%a
+                frag_instr16_rd0_rm3(
+                    THUMB16_UXTB, REG_nZ, dstreg
+                );
+            }
+            #endif
+            
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, dstreg, dstreg
+            );
+        }
+        else if (src == OPARG_A)
+        {
+            // cannot replace with sla/rlca because flags are different
+            switch (arithop)
+            {
+                case ADD:
+                case ADC:
+                    frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_A, REG_A, 1);
+                    
+                    #if SETFLAGS
+                    // nh[2] <- a
+                    frag_rd8_rn16_rm0_shift(
+                        THUMB32_ORR_REG, REG_NH, REG_NH, REG_A, IMM_SHIFT_LSL, 16
+                    );
+                    // nh[3] <- a
+                    frag_rd8_rn16_rm0_shift(
+                        THUMB32_ORR_REG, REG_NH, REG_NH, REG_A, IMM_SHIFT_LSL, 24
+                    );
+                    #endif
+                    
+                    if (carry_in)
+                    {
+                        frag_instr16_rd0_rm3(
+                            THUMB16_ORR_REG, REG_A, REG_Carry
+                        );
+                    }
+                    
+                    #if SETFLAGS
+                    // h[1] <- c
+                    frag_rd8_rn16_rm0_shift(
+                        THUMB32_ORR_REG, REG_NH, REG_NH, REG_Carry, IMM_SHIFT_LSL, 8
+                    );
+                    
+                    // !z <- r%a
+                    frag_instr16_rd0_rm3(
+                        THUMB16_UXTB, REG_nZ, REG_A
+                    );
+                    
+                    // c <- r%a >> 8
+                    frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_Carry, REG_A, 8);
+                    #endif
+
+                    frag_instr16_rd0_rm3(
+                        THUMB16_UXTB, REG_A, REG_A
+                    );
+                    break;
+                
+                case SUB:
+                    frag_ld_imm16(REG_A, 0);
+                    #if SETFLAGS
+                    frag_ld_imm16(REG_nZ, 1); // z <- 0
+                    frag_ld_imm16(REG_Carry, 0);
+                    frag_set_nh(1, 0);
+                    #endif
+                    break;
+                    
+                case SBC:
+                    frag_sbfx(REG_A, Reg_Carry, 0, 1);
+                    #if SETFLAGS
+                    // n <- 0
+                    frag_set_nh(1, 0);
+                    // !z <- c
+                    frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_nZ, REG_Carry);
+                    // h <- c
+                    frag_rd8_rn16_rm0_shift(
+                        THUMB32_ORR_REG, REG_NH, REG_NH, REG_Carry, IMM_SHIFT_LSL, 12
+                    );
+                    // (c unmodified)
+                    #endif
+                    frag_instr16_rd0_rm3(
+                        THUMB16_UXTB, REG_A, REG_A
+                    );
+                    break;
+                
+                case CP:
+                    #if SETFLAGS
+                    frag_ld_imm16(REG_nZ, 0); // z <- 1
+                    frag_set_nh(1, 0);
+                    frag_ld_imm16(REG_Carry, 0);
+                    #endif
+                    break;
+            }
+        }
+        else if (src == OPARG_HLm)
+        {
+            frag_read_hlm();
+        
+        operand_r0:
+            switch (arithop)
+            {
+            case ADD:
+            case ADC:
+                #if SETFLAGS
+                // nh[2] <- r0
+                frag_rd8_rn16_rm0_shift(
+                    THUMB32_ORR_REG, REG_NH, REG_NH, 0, IMM_SHIFT_LSL, 16
+                );
+                
+                // h[3] <- a
+                frag_rd8_rn16_rm0_shift(
+                    THUMB32_ORR_REG, REG_NH, REG_NH, REG_A, IMM_SHIFT_LSL, 24
+                );
+                #endif
+                
+                // r%a += r0
+                frag_instr16_rd0_rn3_rm6(THUMB16_ADD_REG_T1, REG_A, REG_A, 0);
+                
+                #if SETFLAGS
+                if (carry_in)
+                {
+                    // h[1] <- carry
+                    frag_rd8_rn16_rm0_shift(
+                        THUMB32_ORR_REG, REG_NH, REG_NH, REG_Carry, IMM_SHIFT_LSL, 8
+                    );
+                }
+                #endif
+                
+                if (carry_in)
+                {
+                    // r%a += r%carry
+                    frag_instr16_rd0_rn3_rm6(THUMB16_ADD_REG_T1, REG_A, REG_A, 0);
+                }
+                
+                #if SETFLAGS
+                // c <- r%a >> 8
+                frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_Carry, REG_A, 8);
+                
+                // !z <- r%a
+                frag_instr16_rd0_rm3(
+                    THUMB16_UXTB, REG_nZ, REG_A
+                );
+                #endif
+                
+                frag_instr16_rd0_rm3(
+                    THUMB16_UXTB, REG_A, REG_A
+                );
+                break;
+                
+            case SUB:
+            case SBC:
+            case CP:
+                #if SETFLAGS
+                // h[2] <- r0
+                frag_rd8_rn16_rm0_shift(
+                    THUMB32_ORR_REG, REG_NH, REG_NH, 0, IMM_SHIFT_LSL, 16
+                );
+                
+                // h[3] <- r%a
+                frag_rd8_rn16_rm0_shift(
+                    THUMB32_ORR_REG, REG_NH, REG_NH, REG_A, IMM_SHIFT_LSL, 24
+                );
+                #endif
+            
+                // r%dst <- r%a - r0
+                frag_instr16_rd0_rn3_rm6(THUMB16_SUB_REG, dstreg, REG_A, 0);
+                
+                if (carry_in)
+                {
+                    #if SETFLAGS
+                    // h[1] <- c
+                    frag_rd8_rn16_rm0_shift(
+                        THUMB32_ORR_REG, REG_NH, REG_NH, REG_Carry, IMM_SHIFT_LSL, 8
+                    );
+                    #endif
+                    
+                    // r%dst -= r%c
+                    frag_instr16_rd0_rn3_rm6(THUMB16_SUB_REG, dstreg, dstreg, REG_Carry);
+                }
+                
+                #if SETFLAGS
+                // c <- r%dst.8
+                frag_ubfx(REG_Carry, dstreg, 8, 1);
+                
+                if (dstreg != REG_nZ)
+                {
+                    // !z <- r%a
+                    frag_instr16_rd0_rm3(
+                        THUMB16_UXTB, REG_nZ, dstreg
+                    );
+                }
+                #endif
+                
+                frag_instr16_rd0_rm3(
+                    THUMB16_UXTB, dstreg, dstreg
+                );
+                break;
+            }
+        }
+        else if (is_reglo(src))
+        {
+            // r0 <- r%src & 0xff
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, 0, reg_armidx(src)
+            );
+            
+            // note: we could do better by swapping the order of set flags r0
+            goto operand_r0;
+        }
+        else if (is_reghi(src))
+        {
+            const uint8_t reg = reg_armidx(src);
+            
+            // note: we could do better with add-shift
+            frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, 0, reg_armidx(src), 8);
+            
+            goto operand_r0;
+        }
+        else
+        {
+            assert(false);
+        }
+    }
+    else if (dst == REG_HL && is_reg16(src) && arithop == ADD)
+    {
+        // note: Z is not to be modified here.
+        
+        if (src == REG_HL)
+        {
+            // c <- r%hl >> 15
+            frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_Carry, REG_HL, 15);
+            
+            
+            
+            // r%hl <<= 2
+            frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_HL, REG_HL, 1);
+        }
+        else
+        {
+            #if SETFLAGS
+            frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_Carry, reg_armidx(src), 8);
+            #endif
+            
+            // r%hl += r%src
+            frag_add_rd_rn(REG_HL, reg_armid(src));
+            
+            #if SETFLAGS
+            // c <- r%hl >> 16
+            frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_Carry, REG_HL, 16);
+            #endif
+        }
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTH, REG_HL, REG_HL
+        );
+    }
+    else
+    {
+        assert(false);
+    }
 }
 
 static void frag_add(sm83_oparg_t dst, sm83_oparg_t src, int carry)
 {
+    frag_arithmetic(dst, src, carry ? ADC : ADD);
 }
 
 static void frag_sub(sm83_oparg_t dst, sm83_oparg_t src, int carry)
 {
+    frag_arithmetic(dst, src, carry ? SBC : SUB);
 }
 
 static void frag_cp(sm83_oparg_t cmp)
 {
+    frag_arithmetic(dst, src, CP);
 }
 
 static void frag_and(sm83_oparg_t src)
 {
+    frag_bitwise(src, AND);
 }
 
 static void frag_or(sm83_oparg_t src)
 {
+    frag_bitwise(src, OR);
 }
 
 static void frag_xor(sm83_oparg_t src)
 {
+    frag_bitwise(src, XOR);
 }
 
 static void frag_bit(unsigned b, sm83_oparg_t src)
@@ -2046,7 +2592,7 @@ static void frag_bit(unsigned b, sm83_oparg_t src)
     
     #ifdef SETFLAGS
     frag_set_nh(0, 1);
-    frag_ubfx(REG_Z, reg, b + bit_offset, 1);
+    frag_ubfx(REG_nZ, reg, b + bit_offset, 1);
     #endif
 }
 
@@ -2600,7 +3146,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_A, OPARG_Cm);
             
         case 0xF3:
-            return frag_di();
+            return frag_edi(0);
             
         case 0xF5:
             return frag_push(OPARG_AF);
@@ -2621,7 +3167,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_A, OPARG_i16m);
             
         case 0xFB:
-            return frag_ei();
+            return frag_edi(1);
             
         case 0xFD:
             return frag_cp(OPARG_i8);
