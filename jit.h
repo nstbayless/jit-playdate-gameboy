@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 
+#define JIT_ZNH_BIT_N 5
 typedef struct jit_regfile_t
 {
     // we store as 32-bit instead of 16 for better alignment properties.
@@ -13,9 +14,36 @@ typedef struct jit_regfile_t
     uint32_t hl;
     uint32_t sp;
     uint32_t carry;
-    uint32_t pc;
+    
+    // 0 if set
+    // any nonzero value if unset
+    uint32_t z;
+    
+    // bit 0: garbage (could be 0 or 1)
+    // bit 5: n
+    // byte 1: c
+    // byte 2: operand a
+    // byte 3: operand b
+    // h is implicit: it is 1 if (a&0xf+b&xf+c)&0x10
+    uint32_t nh;
 
+    uint32_t pc;
 } jit_regfile_t;
+
+static inline int jit_regfile_getn(uint32_t znh)
+{
+    return (znh >> 5) & 1;
+}
+
+static inline int jit_regfile_geth(uint32_t znh)
+{
+    uint8_t c = (znh >> 8) & 0xff;
+    uint8_t a = (znh >> 16) & 0x0f;
+    uint8_t b = (znh >> 24) & 0x0f;
+    
+    // OPTIMIZE: shift to php z register...
+    return !!((a + b + c) & 0x10);
+}
 
 typedef void (*jit_fn)(jit_regfile_t*);
 

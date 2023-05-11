@@ -7,6 +7,8 @@
     - Arm v7-m architecture reference manual: 
         - https://developer.arm.com/documentation/ddi0489/b/
         - This will help convert between arm opcodes and hexadecimal.
+    - Godbolt copmiler: https://godbolt.org/z/ornhbWjee
+        - see what gcc thinks is the most efficient way to perform your desired operation.
     - ARM-to-hex:
         - https://armconverter.com/ (thumb output)
         - note that the byte-order is weird... it's like 2-3-0-1-ordered in significance.
@@ -29,7 +31,7 @@
             - r4 = BC (high 2 bytes are always 0)
             - r5 = SP (high 2 bytes are always 0)
             - r6 = Carry (only 1 bit is used)
-            - r7 = pointer to jit_regfile_t
+            - r7 = z, n, and h flags (see comment in jit.h)
             - (r0 is used as flex/scratch, and to return cycle count at the end)
             - (note that some registers might not be loaded from jit_regfile_t in the prologue if they are not inputs for this chunk)
             - (similarly, some registers might not be written to jit_regfile_t in the epilogue if they are not modified this chunk)
@@ -63,11 +65,17 @@
         - we can identify this and reduce to just one arm mov instruction.
         
     - we can analyze the rst routines and inline them
+    
+    - store status flags in r2, r3;
+      that way we can clobber them freely during function calls
+      most of the time.
 */
 
 #ifndef JIT_DEBUG
     #define JIT_DEBUG
 #endif
+
+#define SETFLAGS 1
 
 #ifdef TARGET_PLAYDATE
     #ifdef __FPU_USED
@@ -104,7 +112,6 @@ typedef int bool;
 
 // TODO: assign registers programatically
 // reg_flex MUST be reg 0, because r0 is the return register.
-#define REG_REGF 7
 #define REG_FLEX 0
 
 // keep in mind that 4+ are caller-saved
@@ -119,10 +126,29 @@ typedef int bool;
 #define REG_HL REG_IDX(hl)
 #define REG_SP REG_IDX(sp)
 #define REG_Carry REG_IDX(carry)
+#define REG_Z REG_IDX(z)
+#define REG_NH REG_IDX(nh)
+
+// [sic], same opcode, but lsl has non-zero immediate
+#define THUMB16_MOV_REG 0x0000
+#define THUMB16_LSL_IMM 0x0000
+#define THUMB16_LSR_IMM 0x0800
+#define THUMB16_ASR_IMM 0x1000
+#define THUMB16_ORR_REG 0x4300
+#define THUMB16_UXTB    0xB2C0
+
+#define THUMB32_AND_IMM 0xf0000000
+#define THUMB32_BIC_IMM 0xf0200000
+#define THUMB32_ORR_IMM 0xf0400000
+#define THUMB32_ORN_IMM 0xf0600000
+#define THUMB32_EOR_IMM 0xf0800000
+#define THUMB32_ADD_IMM_T3 0xf1000000
+
+#define THUMB32_ORR_REG 0xea400000
 
 // all sm83 registers
-#define REGS_SM83 0xFE
-#define REGS_ALL 0xFF
+#define REGS_SM83 (REG_A | REG_BC | REG_DE | REG_HL | REG_SP | REG_Carry | REG_Z | REG_NH)
+#define REGS_ALL (REGS_SM83 | 1)
 #define REGS_NONFLEX (REGS_ALL & ~1)
 
 #define offsetof_hi(a, b) (offsetof(a, b) + 1)
@@ -157,17 +183,6 @@ typedef enum
     // jump destinations
     ADDR_r8, ADDR_d16, ADDR_HL // relative 8; direct 16; indirect HL
 } sm83_oparg_t;
-
-typedef enum
-{
-    SHIFT_LEFT,
-    ROT_LEFT,
-    ROT_LEFT_CARRY,
-    SHIFT_RIGHT,
-    SHIFT_RIGHT_L,
-    ROT_RIGHT,
-    ROT_RIGHT_CARRY,
-} rotate_type;
 
 static jit_opts opts;
 static jit_ht_entry* jit_hashtable[JIT_HASHTABLE_SIZE];
@@ -595,11 +610,6 @@ static void frag_bl(fn_type fn)
     );
 }
 
-static void frag_set_n(int set)
-{
-    // TODO
-}
-
 // see ThumbExpand_C
 static unsigned thumbexpand_encoding(uint8_t value, unsigned ror)
 {
@@ -679,16 +689,29 @@ static void frag_pre_readwrite_hlm(void)
     frag_armpush(REGS_NONFLEX & 0xf);
     
     // movs r0, r%hl
-    frag_instr16(0x0000 | (REG_HL << 3));
+    frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, REG_HL);
     
     frag_bl((fn_type)opts.read);
+}
+
+static void frag_read_hlm(void)
+{
+    assert(REG_HL >= 4); // need this to be able to copy hl to r0 for argument.
+    frag_armpush(REGS_NONFLEX & 0xf);
+    
+    // movs r0, r%hl
+    frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, REG_HL);
+    
+    frag_bl((fn_type)opts.read);
+    
+    frag_armpop(REGS_NONFLEX & 0xf);
 }
 
 // writes r1 to (hl), then pops r1-r3.
 static void frag_post_readwrite_hlm(void)
 {
     // movs r0, r%hl
-    frag_instr16(0x0000 | (REG_HL << 3));
+    frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, REG_HL);
     
     frag_bl((fn_type)opts.write);
     
@@ -696,6 +719,101 @@ static void frag_post_readwrite_hlm(void)
     
     // we have to stop if we write to rom.
     if (!opts.fixed_bank) dis.done = 1;
+}
+
+static void frag_instr16_rd0_rm3(
+    uint16_t instruction,
+    uint8_t rd,
+    uint8_t rm
+)
+{
+    assert( rd == (rd & 0x7) );
+    assert( rm == (rm & 0x7) );
+    frag_instr16(
+        instruction | rd | (rm << 3)
+    );
+}
+
+static void frag_instr16_rd0_rm3_imm5(
+    uint16_t instruction,
+    uint8_t rd,
+    uint8_t rm,
+    uint8_t imm5
+)
+{
+    assert( rd == (rd & 0x7) );
+    assert( rm == (rm & 0x7) );
+    frag_instr16_rd0_rm3(
+        instruction | (imm5 << 6), rd, rm
+    );
+}
+
+static void frag_ubfx(
+    uint8_t rd,
+    uint8_t rn,
+    uint8_t pos,
+    uint8_t width
+)
+{
+    frag_instr16(
+        0xf3c00000
+        | (rd << 8)
+        | (rn << 16)
+        | (width & 0b11111)
+        | (bits(pos, 0, 2) << 6)
+        | (bits(pos, 2, 3) << 12)
+    );
+}
+
+static void frag_sbfx(
+    uint8_t rd,
+    uint8_t rn,
+    uint8_t pos,
+    uint8_t width
+)
+{
+    frag_instr16(
+        0xf3400000
+        | (rd << 8)
+        | (rn << 16)
+        | (width & 0b11111)
+        | (bits(pos, 0, 2) << 6)
+        | (bits(pos, 2, 3) << 12)
+    );
+}
+
+#define IMM_SHIFT_LSL 0
+#define IMM_SHIFT_LSR 1
+#define IMM_SHIFT_ASR 2
+#define IMM_SHIFT_ROR 3
+#define IMM_SHIFT_RRX 4
+
+static void frag_rd8_rn16_rm0_shift(
+    uint32_t instruction,
+    uint8_t rd,
+    uint8_t rn,
+    uint8_t rm,
+    uint8_t shift_type,
+    uint8_t shift_x
+)
+{
+    if (shift_type == IMM_SHIFT_RRX)
+    {
+        assert(shift_x == 0);
+        shift_type = IMM_SHIFT_ROR;
+    }
+    if (shift_type != IMM_SHIFT_LSL)
+    {
+        assert(shift_x != 0);
+    }
+    
+    return instruction
+        | (rm)
+        | (rd << 8)
+        | (rn << 16)
+        | (shift_type << 4)
+        | (bits(shift_x, 0, 2) << 6)
+        | (bits(shift_x, 2, 3) << 12);
 }
 
 static void frag_imm12c_rd8_rn16(
@@ -719,15 +837,83 @@ static void frag_imm12c_rd8_rn16(
     );
 }
 
+static void frag_set_n(bool n)
+{
+    frag_imm12c_rd8_rn16(
+        n ? THUMB32_ORR_IMM : THUMB32_BIC_IMM,
+        REG_NH, REG_NH, false, 0x20, 0
+    );
+}
+
+static void frag_set_nh(bool n, bool h)
+{
+    const uint16_t value = (n << 5) | (h << 12);
+    frag_ld_imm16(REG_NH, value);
+    #if 0
+    if (n && h)
+    {
+        // uxth r%znh, r%znh
+        frag_instr16(0xb280 | (REG_NH << 3) | REG_NH);
+        
+        // orr.w r%znh, r%znh, #$1020
+        frag_imm12c_rd8_rn16(
+            THUMB32_ORR_IMM,
+            REG_NH, REG_NH, false, 0x81, 27
+        );
+    }
+    else if (n && !h)
+    {
+        // uxtb r%znh, r%znh
+        frag_instr16(
+            0xB2C0
+            | (REG_NH << 3)
+            | (REG_NH << 0)
+        );
+        
+        // orr.w r%znh, r%znh, #$20
+        frag_imm12c_rd8_rn16(
+            THUMB32_ORR_IMM,
+            REG_NH, REG_NH, false, 0x20, 0
+        );
+    }
+    else if (!n && h)
+    {
+        // bic.w r%znh, r%znh, #$20
+        frag_imm12c_rd8_rn16(
+            THUMB32_BIC_IMM,
+            REG_NH, REG_NH, false, 0x20, 24
+        );
+        
+        // we could avoid this if we are more careful with how we read h implicitly.
+        // uxth r%znh, r%znh
+        frag_instr16(0xb280 | (REG_NH << 3) | REG_NH);
+        
+        // orr.w r%znh, r%znh, #$1000
+        frag_imm12c_rd8_rn16(
+            THUMB32_ORR_IMM,
+            REG_NH, REG_NH, false, 0x10, 24
+        );
+    }
+    else if (!n && !h)
+    {
+        // and.w r%znh, r%znh, #1
+        frag_imm12c_rd8_rn16(
+            THUMB32_AND_IMM,
+            REG_NH, REG_NH, false, 1, 0
+        );
+    }
+    #endif
+}
+
 // v: 0 if clear, 1 if set.
 // b: the bit to set (0-7)
 static void frag_set(unsigned b, sm83_oparg_t dst, int v)
 {
     uint32_t instruction = (v)
         // orr.w
-        ? 0xf0400000
+        ? THUMB32_ORR_IMM
         // bic
-        : 0xf0200000;
+        : THUMB32_BIC_IMM;
     
     if (dst == OPARG_HLm)
     {
@@ -755,6 +941,17 @@ static void frag_set(unsigned b, sm83_oparg_t dst, int v)
     }
 }
 
+static void frag_cpl(void)
+{
+    // eor r%a, #$ff
+    frag_imm12c_rd8_rn16(
+        THUMB32_EOR_IMM,
+        REG_A, REG_A, 0, 0xff, 0
+    );
+    
+    frag_set_nh(true, true);
+}
+
 static void frag_incdec(sm83_oparg_t arg, bool dec)
 {
     const uint16_t op = (dec)
@@ -772,37 +969,87 @@ static void frag_incdec(sm83_oparg_t arg, bool dec)
         
         // uxth r%arg, r%arg
         frag_instr16(0xb280 | (reg_armidx(arg) << 3) | reg_armidx(arg));
+        
+        // [sic] flags are unaffected
     }
     else if (is_reg8(arg))
     {
         if (arg == OPARG_A)
         {
-            // adds r%arg, 1 [T2]
+            #if SETFLAGS
+            if (!dec)
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSL_IMM, REG_NH, reg, 16
+                );
+            }
+            #endif
+            
+            // adds/subs r%arg, 1 [T2]
             frag_instr16(op | (reg_armidx(arg) << 8));
             
-            // uxtb r%arg, r%arg
-            frag_instr16(
-                0xB2C0
-                | (reg_armidx(arg) << 3)
-                | (reg_armidx(arg) << 0)
+            #if SETFLAGS
+            if (dec)
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSL_IMM, REG_NH, reg, 24
+                );
+            }
+            #endif
+            
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, REG_A, REG_A
             );
             
-            // TODO: znh
+            #if SETFLAGS
+            frag_imm12c_rd8_rn16(
+                THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+            );
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_Z, REG_A);
+            #endif
         }
         else if (is_reglo(arg))
         {
-            // lsrs r0, r%arg,#8
-            frag_instr16(0x0a00 | (reg_armidx(arg) << 3) | (0 << 0));
+            // lsrs r0, r%arg, #8
+            frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, 0, reg_armidx(arg), 8);
             
-            // adds r%arg, 1 [T2]
+            #if SETFLAGS
+            if (!dec)
+            {
+                frag_instr16_rd0_rm3(
+                    THUMB16_UXTB, REG_NH, reg_armidx(arg)
+                );
+            }
+            #endif
+            
+            // adds/subs r%arg, 1 [T2]
             frag_instr16(op | (reg_armidx(arg) << 8));
             
-            // uxtb r%arg, r%arg
-            frag_instr16(
-                0xB2C0
-                | (reg_armidx(arg) << 3)
-                | (reg_armidx(arg) << 0)
+            #if SETFLAGS
+            if (!dec)
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSL_IMM, REG_NH, REG_NH, 16
+                );
+            }
+            else
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSL_IMM, REG_NH, reg_armidx(arg), 24
+                );
+            }
+            #endif
+            
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, reg_armidx(arg), reg_armidx(arg)
             );
+            
+            #if SETFLAGS
+            frag_imm12c_rd8_rn16(
+                THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+            );
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, REG_Z, REG_A);
+            #endif
             
             // orr.w r%arg, r%arg, r0<<8
             frag_instr32(
@@ -811,31 +1058,83 @@ static void frag_incdec(sm83_oparg_t arg, bool dec)
                 | (reg_armidx(arg) << 8)
                 | (0 << 0)
             );
-            
-            // TODO: znh
         }
         else if (is_reghi(arg))
         {
-            // adds r%arg, r%arg, #$100
+            #if SETFLAGS
+            if (!dec)
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSR_IMM, REG_NH, reg_armidx(arg), 8
+                );
+            }
+            #endif
+            
+            // adds/subs r%arg, r%arg, #$100
             frag_imm12c_rd8_rn16(
                 op32, reg_armidx(arg), reg_armidx(arg), false, 0x1, 8
             );
             
+            #if SETFLAGS
+            if (dec)
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSR_IMM, REG_NH, reg_armidx(arg), 8
+                );
+            }
+            else
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSL_IMM, REG_NH, REG_NH, 16
+                );
+            }
+            #endif
+            
             // uxth r%arg, r%arg
             frag_instr16(0xb280 | (reg_armidx(arg) << 3) | reg_armidx(arg));
             
-            // TODO: znh
+            // TODO: nh
+            
+            #if SETFLAGS
+            if (dec)
+            {
+                frag_instr16_rd0_rm3_imm5(
+                    THUMB16_LSL_IMM, REG_NH, REG_NH, 16
+                );
+            }
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LSR_IMM, REG_Z, reg_armidx(arg), 8
+            );
+            frag_imm12c_rd8_rn16(
+                THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+            );
+            #endif
         }
-        
-        frag_set_n(0);
     }
     else if (arg == OPARG_HLm)
     {
-        // TODO
         frag_pre_readwrite_hlm();
         
-        // adds r0,r0,#1 [T2]
+        #if SETFLAGS
+        if (!dec)
+        {
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LSL_IMM, REG_NH, 0, 24
+            );
+        }
+        #endif
+        
+        // adds/subs r0,r0,#1 [T2]
         frag_instr16(op);
+        
+        #if SETFLAGS
+        if (dec)
+        {
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LSL_IMM, REG_NH, 0, 24
+            );
+        }
+        #endif
         
         // uxtb r1, r1
         frag_instr16(
@@ -844,9 +1143,16 @@ static void frag_incdec(sm83_oparg_t arg, bool dec)
             | (1 << 0)
         );
         
-        frag_post_readwrite_hlm();
+        #if SETFLAGS
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSR_IMM, REG_Z, 0, 8
+        );
+        frag_imm12c_rd8_rn16(
+            THUMB32_ORR_IMM, REG_NH, REG_NH, 0, 0x80 + dec, 27
+        );
+        #endif
         
-        frag_set_n(0);
+        frag_post_readwrite_hlm();
     }
     else
     {
@@ -868,10 +1174,9 @@ static void frag_dec(sm83_oparg_t arg)
 // no assumptions are made about the contents of dst
 static void frag_ld_imm16(int dstidx, uint16_t imm)
 {
-    // disabled because affecting the flags is scary.
-    if (imm <= 0xff)
+    if (imm <= 0xff && (dstidx == (dstidx & 0x07)))
     {
-        // MOVS r%dst, imm
+        // MOVS r%dst, imm [T1]
         frag_instr16(
             0x2000
             | (imm)
@@ -902,23 +1207,23 @@ static void frag_store_rz_reg8(int dstidx, sm83_oparg_t src)
     const uint8_t rn = reg_armidx(src);
     const uint8_t rd = dstidx;
     
-    if (is_reghi(src))
+    if (src == REG_A)
+    {
+        frag_instr16_rd0_rm3(
+            THUMB16_MOV_REG, dstidx, REG_A
+        );
+    }
+    else if (is_reghi(src))
     {
         // lsrs r%dst, r%src, 8
-        frag_instr16(
-            0x0A00
-            | (rd << 0)
-            | (rn << 3)
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSR_IMM, rd, rn, 8
         );
     }
     else
     {
         // movs r%dst, r%src
-        frag_instr16(
-            0x0000
-            | (rd << 0)
-            | (rn << 3)
-        );
+        frag_instr16_rd0_rm3(THUMB16_MOV_REG, rd, rn);
         
         // uxtb r%dst, r%dst
         frag_instr16(
@@ -1046,7 +1351,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         case OPARG_DEm:
         case OPARG_HLm:
             // movs r0, r%src
-            frag_instr16(0x0000 | (reg_armidx(src) << 3));
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, reg_armidx(src));
             break;
         case OPARG_i8m:
             immediate |= 0xff00;
@@ -1092,7 +1397,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         case OPARG_DEm:
         case OPARG_HLm:
             // movs r0, r%dst
-            frag_instr16(0x0000 | (reg_armidx(dst) << 3));
+            frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, reg_armidx(dst));
             break;
         case OPARG_i8m:
             immediate |= 0xff00;
@@ -1160,7 +1465,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     if (immediate != 0)
                     {
                         frag_imm12c_rd8_rn16(
-                            0xf0400000, reg_armidx(dst), reg_armidx(dst), 0, immediate, 24
+                            THUMB32_ORR_IMM, reg_armidx(dst), reg_armidx(dst), 0, immediate, 24
                         );
                     }
                 }
@@ -1168,17 +1473,14 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                 {
                     // and r%dst, $ff00
                     frag_imm12c_rd8_rn16(
-                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
+                        THUMB32_AND_IMM, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                     
                     // orr  r%dst, imm
                     if (immediate != 0)
                     {
-                        frag_instr32(
-                            0xF0400000
-                            | (reg_armidx(dst) << 8)
-                            | (reg_armidx(dst) << 16)
-                            | immediate
+                        frag_imm12c_rd8_rn16(
+                            THUMB32_ORR_IMM, reg_armidx(dst), reg_armidx(dst), 0, immediate, 0
                         );
                     }
                 }
@@ -1242,7 +1544,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     
                     // and r%src, $ff00
                     frag_imm12c_rd8_rn16(
-                        0xf0000000, reg_armidx(src), reg_armidx(src), 0, 0xff, 24
+                        THUMB32_AND_IMM, reg_armidx(src), reg_armidx(src), 0, 0xff, 24
                     );
                     
                     // orr r%dst, r%src
@@ -1259,7 +1561,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                 {
                     // and r%dst, $ff00
                     frag_imm12c_rd8_rn16(
-                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
+                        THUMB32_AND_IMM, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                     
                     frag_armpush(1 << reg_armidx(src));
@@ -1302,15 +1604,14 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
                     // OPTIMIZE -- can skip this if we know src's hi is 0.
                     // and r%dst, $ff00
                     frag_imm12c_rd8_rn16(
-                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
+                        THUMB32_AND_IMM, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                 }
                 else if (!is_reghi(dst) && is_reghi(src))
                 {
                     // and r%dst, $ff00
-                    // and r%src, $ff00
                     frag_imm12c_rd8_rn16(
-                        0xf0000000, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
+                        THUMB32_AND_IMM, reg_armidx(dst), reg_armidx(dst), 0, 0xff, 24
                     );
                     
                     // orr r%dst, r%dst, r%src, lsr #8
@@ -1354,14 +1655,301 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
     }
 }
 
-static void frag_rotate(rotate_type rt, sm83_oparg_t dst)
+typedef enum
 {
-    // TODO
+    SHIFT_LEFT,
+    ROT_LEFT,
+    ROT_LEFT_CARRY,
+    SHIFT_RIGHT,
+    SHIFT_RIGHT_L,
+    ROT_RIGHT,
+    ROT_RIGHT_CARRY,
+} rotate_type;
+
+static void frag_rotate_helper(rotate_type rt, uint8_t regdst, uint8_t reg, uint8_t carry_in, uint8_t carry_out, bool setz)
+{
+    const uint8_t scratchreg = (reg == 0) ? 1 : 0;
+    switch (rt)
+    {
+    case ROT_LEFT:
+    case SHIFT_LEFT:
+    case ROT_LEFT_CARRY:
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSL_IMM, reg, reg, 1
+        );
+        
+        if (rt == ROT_LEFT_CARRY)
+        {
+            frag_instr16_rd0_rm3(
+                THUMB16_ORR_REG, reg, carry_in
+            );
+        }
+        else if (rt == ROT_LEFT)
+        {
+            frag_rd8_rn16_rm0_shift(
+                THUMB32_ORR_REG, reg, reg, reg, IMM_SHIFT_LSR, 8
+            );
+        }
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, regdst, reg
+        );
+        break;
+    
+    case SHIFT_RIGHT:
+    case ROT_RIGHT:
+    case ROT_RIGHT_CARRY:
+        if (rt == ROT_RIGHT)
+        {
+            frag_rd8_rn16_rm0_shift(
+                THUMB32_ORR_REG, reg, reg, reg, IMM_SHIFT_LSL, 8
+            );
+        }
+        else if (rt == ROT_RIGHT_CARRY)
+        {
+            frag_rd8_rn16_rm0_shift(
+                THUMB32_ORR_REG, reg, reg, carry, IMM_SHIFT_LSL, 8
+            );
+        }
+        
+        frag_ubfx(regdst, reg, 1, 8);
+        break;
+        
+    case SHIFT_RIGHT_L:
+        frag_sbfx(reg, reg, 1, 8);
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, regdst, reg
+        );
+        break;
+    }
+    
+    if (setz)
+    {
+        frag_instr16_rd0_rm3(
+            THUMB16_MOV_REG, REG_Z, regdst
+        );
+    }
+}
+
+static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
+{
+    assert(is_reg8(dst) || dst == OPARG_HLm);
+    
+    if (dst == OPARG_HLm)
+    {
+        frag_pre_readwrite_hlm();
+    }
+    
+    
+    uint8_t carry_in = REG_Carry;
+    const uint8_t carry_out = REG_Carry;
+    #if SETFLAGS
+    const uint8_t bit_offset = is_reghi(dst)
+        ? 8
+        : 0;
+    const uint8_t reg = (dst == OPARG_HLm) ? 0 : reg_armidx(dst);
+    
+    // transfer previous carry flag to nh;
+    // this will effectively clear nh, and will allow us to briefly
+    // rely on REG_NH containing the carry bit,
+    // which some rotations need to read.
+    // we can then freely set the carry (out) in advance of the operation.
+    carry_in = REG_NH;
+    
+    frag_instr16_rd0_rm3(
+        THUMB16_MOV_REG, REG_NH, REG_Carry
+    );
+    
+    // set carry out
+    switch (rt)
+    {
+    case SHIFT_LEFT:
+    case ROT_LEFT:
+    case ROT_LEFT_CARRY:
+        frag_ubfx(REG_Carry, reg, 7+bit_offset, 1);
+        break;
+        
+    case SHIFT_RIGHT:
+    case SHIFT_RIGHT_L:
+    case ROT_LEFT:
+    case ROT_LEFT_CARRY:
+        frag_ubfx(REG_Carry, reg, 0+bit_offset, 1);
+        break;
+    }
+    #endif
+    
+    if (dst == OPARG_A)
+    {
+        frag_rotate_helper(rt, OPARG_A, OPARG_A, carry_in, carry_out, setz);
+    }
+    else if (is_reglo(dst))
+    {
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, 0, reg
+        );
+        frag_imm12c_rd8_rn16(
+            THUMB32_AND_IMM, reg, reg, false, 0xff, 24
+        );
+        frag_rotate_helper(rt, 0, 0, carry_in, carry_out, setz);
+        frag_instr16_rd0_rm3(
+            THUMB16_ORR_REG, reg, 0
+        );
+    }
+    else if (is_reghi(dst))
+    {
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSR_IMM, 0, reg, 8
+        );
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, reg, reg
+        );
+        frag_rotate_helper(rt, 0, 0, carry_in, carry_out, setz);
+        frag_rd8_rn16_rm0_shift(
+            THUMB32_ORR_REG, reg, reg, 0, IMM_SHIFT_LSL, 8
+        );
+    }
+    else if (dst == OPARG_HLm)
+    {
+        frag_rotate_helper(rt, 1, 0, carry_in, carry_out, setz);
+        frag_post_readwrite_hlm();
+    }
+    else
+    {
+        assert(false);
+    }
+    
+    // TODO: z=0/*
 }
 
 static void frag_swap(sm83_oparg_t dst)
 {
-    assert(is_reg8(dst));
+    assert(is_reg8(dst) || dst == OPARG_HLm);
+    
+    if (dst == OPARG_A)
+    {
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSR_IMM, 0, REG_A, 4
+        );
+        
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSL_IMM, REG_A, REG_A, 4
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, REG_A, REG_A
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_ORR_REG, REG_A, 0
+        );
+        
+        #if SETFLAGS
+        // f: z=*
+        frag_instr16_rd0_rm3(
+            THUMB16_MOV_REG, REG_Z, REG_A
+        );
+        #endif
+    }
+    else if (is_reglo(dst))
+    {
+        // TODO: optimize
+        frag_ubfx(0, reg_armidx(dst), 4, 4);
+        
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSL_IMM, REG_Z, reg_armidx(dst), 4
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_ORR_REG, REG_Z, 0
+        );
+        
+        // zero-out low byte
+        frag_imm12c_rd8_rn16(
+            THUMB32_AND_IMM, reg_armidx(dst), reg_armidx(dst), false, 0xff, 24
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, REG_Z, REG_Z
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_ORR_REG, reg_armidx(dst), REG_Z
+        );
+        
+        // z=* (already done, for free)
+    }
+    else if (is_reghi(dst))
+    {
+        // TODO: optimize
+        frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, 0, reg_armidx(dst), 4);
+        
+        frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_Z, reg_armidx(dst), 4);
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, reg_armidx(dst), reg_armidx(dst)
+        );
+        
+        frag_imm12c_rd8_rn16(
+            THUMB32_AND_IMM, REG_Z, REG_Z, false, 0xf0, 24
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_ORR_REG, REG_Z, 0
+        );
+        
+        // zero-out low byte
+        frag_imm12c_rd8_rn16(
+            THUMB32_AND_IMM, REG_Z, REG_Z, false, 0xff, 24
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_ORR_REG, reg_armidx(dst), REG_Z
+        );
+    }
+    else if (dst == OPARG_HLm)
+    {
+        frag_pre_readwrite_hlm();
+        
+        // r0 now contains (HL)
+        
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSR_IMM, 1, 0, 4
+        );
+        
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSL_IMM, 0, 0, 4
+        );
+        
+        // OPT: this can be skipped if .write() takes uint32_t
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, 0, 0
+        );
+        
+        frag_instr16_rd0_rm3(
+            THUMB16_ORR_REG, 1, 0
+        );
+        
+        #if SETFLAGS
+        // f: z=*
+        frag_instr16_rd0_rm3(
+            THUMB16_MOV_REG, REG_Z, 1
+        );
+        #endif
+        
+        frag_post_readwrite_hlm();
+    }
+    else
+    {
+        assert(false);
+    }
+    
+    
+    #if SETFLAGS
+    // f: nhc = 0
+    frag_ld_imm16(REG_Carry, 0);
+        
+    frag_set_nh(false, false);
+    #endif
 }
 
 static void frag_jump(sm83_oparg_t condition, sm83_oparg_t addrmode)
@@ -1396,16 +1984,22 @@ static void frag_daa(void)
 // set carry flag
 static void frag_scf(void)
 {
+    #if SETFLAGS
+    frag_ld_imm16(REG_Carry, 1);
+    frag_set_nh(0, 0);
+    #endif
 }
 
 // flip carry flag
 static void frag_ccf(void)
 {
-}
-
-// one's complement of A
-static void frag_cpl(void)
-{
+    #if SETFLAGS
+    frag_imm12c_rd8_rn16(
+        THUMB32_EOR_IMM,
+        REG_Carry, REG_Carry, 0, 1, 0
+    );
+    frag_set_nh(0, 0);
+    #endif
 }
 
 static void frag_di(void)
@@ -1442,6 +2036,18 @@ static void frag_xor(sm83_oparg_t src)
 
 static void frag_bit(unsigned b, sm83_oparg_t src)
 {
+    const uint8_t bit_offset = (is_reghi(src)) ? 8 : 0;
+    uint8_t reg = reg_armidx(src);
+    if (src == OPARG_HLm)
+    {
+        reg = 0;
+        frag_read_hlm();
+    }
+    
+    #ifdef SETFLAGS
+    frag_set_nh(0, 1);
+    frag_ubfx(REG_Z, reg, b + bit_offset, 1);
+    #endif
 }
 
 static void frag_push(sm83_oparg_t src)
@@ -1460,14 +2066,14 @@ static void frag_push(sm83_oparg_t src)
         // subs r%sp, 2 [T2]
         frag_instr16(0x3802 | (REG_SP << 8));
         
-        // mov r%sp, r1
-        frag_instr16(0x0000 | (reg_armidx(src) << 3) | 1);
+        // mov r1, r%src
+        frag_instr16_rd0_rm3(THUMB16_MOV_REG, 1, reg_armidx(src));
         
         // uxth r%sp, r%sp
         frag_instr16(0xb280 | (REG_SP << 3) | REG_SP);
         
         // mov r0, r%sp
-        frag_instr16(0x0000 | (REG_SP << 3));
+        frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, REG_SP);
         
         frag_bl((fn_type)opts.write);
         
@@ -1493,7 +2099,7 @@ static void frag_pop(sm83_oparg_t dst)
         frag_armpush(regs);
         
         // mov r0, r%sp
-        frag_instr16(0x0000 | (REG_SP << 3));
+        frag_instr16_rd0_rm3(THUMB16_MOV_REG, 0, REG_SP);
         
         // adds r%sp, 2 [T2]
         frag_instr16(0x3002 | (REG_SP << 8));
@@ -1506,7 +2112,7 @@ static void frag_pop(sm83_oparg_t dst)
         frag_armpop(regs);
         
         // mov r%dst, r0
-        frag_instr16(0x0000 | reg_armidx(dst));
+        frag_instr16_rd0_rm3(THUMB16_MOV_REG, reg_armidx(dst), 0);
     }
     else
     {
@@ -1615,7 +2221,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_B, OPARG_i8);
             
         case 0x07:
-            return frag_rotate(ROT_LEFT_CARRY, OPARG_A);
+            return frag_rotate(ROT_LEFT_CARRY, OPARG_A, false);
             
         case 0x08:
             return frag_ld(OPARG_i16m, OPARG_SP);
@@ -1639,7 +2245,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_C, OPARG_i8);
             
         case 0x0F:
-            return frag_rotate(ROT_RIGHT_CARRY, OPARG_A);
+            return frag_rotate(ROT_RIGHT_CARRY, OPARG_A, false);
         
         case 0x10: // STOP
             dis.done = 1;
@@ -1664,7 +2270,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_D, OPARG_i8);
             
         case 0x17:
-            return frag_rotate(ROT_LEFT, OPARG_A);
+            return frag_rotate(ROT_LEFT, OPARG_A, false);
             
         case 0x18:
             return frag_jump(COND_none, ADDR_r8);
@@ -1688,7 +2294,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_E, OPARG_i8);
             
         case 0x1F:
-            return frag_rotate(ROT_RIGHT, OPARG_A);
+            return frag_rotate(ROT_RIGHT, OPARG_A, false);
             
         case 0x20:
             return frag_jump(COND_nz, ADDR_r8);
@@ -1876,21 +2482,21 @@ static void disassemble_instruction(void)
                 switch(opx/8)
                 {
                 case 0x00/8:
-                    return frag_rotate(ROT_LEFT_CARRY, arg);
+                    return frag_rotate(ROT_LEFT_CARRY, arg, true);
                 case 0x08/8:
-                    return frag_rotate(ROT_RIGHT_CARRY, arg);
+                    return frag_rotate(ROT_RIGHT_CARRY, arg, true);
                 case 0x10/8:
-                    return frag_rotate(ROT_LEFT, arg);
+                    return frag_rotate(ROT_LEFT, arg, true);
                 case 0x18/8:
-                    return frag_rotate(ROT_RIGHT, arg);
+                    return frag_rotate(ROT_RIGHT, arg, true);
                 case 0x20/8:
-                    return frag_rotate(SHIFT_LEFT, arg);
+                    return frag_rotate(SHIFT_LEFT, arg, true);
                 case 0x28/8:
-                    return frag_rotate(SHIFT_RIGHT, arg);
+                    return frag_rotate(SHIFT_RIGHT, arg, true);
                 case 0x30/8:
                     return frag_swap(arg);
                 case 0x38/8:
-                    return frag_rotate(SHIFT_RIGHT_L, arg);
+                    return frag_rotate(SHIFT_RIGHT_L, arg, true);
                 case 0x40/8 ... 0x78/8:
                     return frag_bit((opx/8 - 0x40/8), arg);
                 case 0x80/8 ... 0xB8/8:
@@ -2063,19 +2669,27 @@ static void disassemble_padding(void)
         0xC800 | REGS_SM83 | (0 << 8)
     );
     
-    // movs r%regf, r%0
-    frag_instr16(0x0000 | (0 << 3) | (REG_REGF << 0));
+    // push { r0 }
+    prologue_16(0xb400 | (1 << 0));
+    
+    // pop {r0}
+    epilogue_16(0xbc00 | (1 << 0));
     
     // STM r%regf, { ... }
     epilogue_16(
-        0xC000 | REGS_SM83 | (REG_REGF << 8)
+        0xC000 | REGS_SM83 | (0 << 8)
     );
+    
     
     // pop {...}
     frag_armpop(reg_push | (dis.use_lr << 14));
     
-    // ret
+    // bx lr
     epilogue_16(0x4770);
+    
+    // TODO: figure out when this is needed exactly.
+    // nop
+    epilogue_16(0xbf00);
     
     assert(padc <= JIT_START_PADDING_ENTRY_C);
 }
