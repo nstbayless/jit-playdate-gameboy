@@ -54,6 +54,48 @@ static inline bool jit_regfile_geth(uint32_t nh)
     }
 }
 
+// returns corrected value in lower 8 bits (r0)
+// returns new value of carry in bit 32 (r1)
+// all other bits are clear.
+// remember to set Z=* and H=0 after calling this.
+static inline uint64_t jit_regfile_daa(const uint32_t nh, uint8_t v, const bool c)
+{
+    // adapted with reference to peanut_gb.h
+    const uint8_t n = jit_regfile_getn(nh);
+    const uint8_t h = jit_regfile_geth(nh);
+    if (n)
+    {
+        if (h)
+        {
+            v = (v - 0x06) & 0xFF;
+        }
+
+        if (c)
+        {
+            v -= 0x60;
+        }
+    }
+    else
+    {
+        if (h || (v & 0x0F) > 9)
+        {
+            v += 0x06;
+        }
+
+        if (c || v > 0x9F)
+        {
+            v += 0x60;
+        }
+    }
+
+    if (v & 0x100)
+    {
+        c = 1;
+    }
+    
+    return (v) | ((uint64_t)c << 32)
+}
+
 static inline uint8_t jit_regfile_get_f(uint32_t carry, uint32_t z, uint32_t nh)
 {
     return ((!z) << 7) | (carry << 4) | jit_regfile_geth(nh) << 5 | (jit_regfile_getn(nh) << 6);
