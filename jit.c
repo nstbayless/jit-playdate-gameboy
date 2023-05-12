@@ -150,6 +150,7 @@ typedef int bool;
 #define THUMB16_UXTH    0xB280
 #define THUMB16_UXTB    0xB2C0
 #define THUMB16_STR     0x6000
+#define THUMB16_LDR     0x6800
 #define THUMB16_STRH    0x8000
 #define THUMB16_CBZ     0xB100
 #define THUMB16_CBNZ    0xB900
@@ -916,7 +917,20 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
         assert(REGS_NONFLEX & (1 << reg_sp_tmp));
         
         frag_mov_rd_rm(reg_regfile, 0);
-        frag_mov_rd_rm(0, REG_SP);
+        if (dis.use_sp)
+        {
+            frag_mov_rd_rm(0, REG_SP);
+        }
+        else
+        {
+            // ldr r0, [r0, #jit_regfile_t.sp]
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LDR,
+                0,
+                0,
+                offsetof(jit_regfile_t, sp) >> 2
+            );
+        }
         frag_mov_rd_rm(reg_sp_tmp, 0);
         
         frag_bl((fn_type)opts.read16);
