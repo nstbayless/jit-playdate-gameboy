@@ -112,6 +112,7 @@ typedef void (*jit_fn)(jit_regfile_t*);
 typedef struct
 {
     const void* rom;
+    uint16_t pc;
     void* wram;
     void* hram;
     void (*stop)(void);

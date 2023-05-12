@@ -104,6 +104,7 @@ void do_test(const uint8_t* rom)
 {
 	jit_opts opts = {
 		.rom = rom,
+		.pc = 0,
 		.wram = wram,
 		.hram = hram,
 		.stop = test_stop,
