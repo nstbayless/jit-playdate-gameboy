@@ -117,6 +117,14 @@
     #undef ADC
 #endif
 
+#ifdef IN
+    #undef IN
+#endif
+
+#ifdef OUT
+    #undef OUT
+#endif
+
 // TODO: assign registers programatically
 // reg_flex MUST be reg 0, because r0 is the return register.
 #define REG_FLEX 0
@@ -1146,12 +1154,12 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
     uint8_t reg_regfile = 0;
     uint8_t reg_pc = 1;
     const uint8_t reg_sp_tmp = 5;
-    if (pc > 0)
+    if (pc >= 0)
     {
         assert(pc < 0x10000);
         frag_ld_imm16(reg_pc, pc);
     }
-    if (pc == -1)
+    else if (pc == -1)
     {
         frag_mov_rd_rm(reg_pc, REG_HL);
     }
@@ -2139,6 +2147,13 @@ static void frag_rotate_helper(rotate_type rt, uint8_t regdst, uint8_t reg, uint
             THUMB16_MOV_REG, REG_nZ, regdst
         );
     }
+    else
+    {
+        // z <- 0
+        frag_ld_imm16(
+            REG_nZ, 1
+        );
+    }
 }
 
 static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
@@ -2735,6 +2750,7 @@ static void frag_bitwise(sm83_oparg_t src, arithop_t arithop)
         assert(false);
         break;
     }
+    frag_ld_imm16(REG_Carry, 0);
     #endif
 }
 
@@ -3356,6 +3372,784 @@ static sm83_oparg_t arg_from_op(uint8_t op)
     
     // unused
     return OPARG_A;
+}
+
+static void collect_dependencies(void)
+{
+    #define IN(...)
+    #define OUT(...)
+    uint8_t op;
+    switch (op = sm83_next_byte())
+    {
+        case 0x00: // NOP
+            break;
+            
+        case 0x01:
+            // ld BC, i16
+            OUT(BC);
+            break;
+            
+        case 0x02:
+            // ld (BC), A
+            IN(BC, A);
+            break;
+            
+        case 0x03:
+            // inc BC
+            IN(BC);
+            OUT(BC);
+            break;
+        
+        case 0x04:
+            // inc B
+            IN(BC);
+            OUT(BC, Z, NH);
+            break;
+            
+        case 0x05:
+            // dec B
+            IN(BC);
+            OUT(BC, Z, NH);
+            break;
+            
+        case 0x06:
+            // ld b, i8
+            OUT(BC);
+            break;
+            
+        case 0x07:
+            // rlca
+            IN(A, C);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0x08:
+            // ld (i16), SP
+            IN(SP);
+            break;
+            
+        case 0x09:
+            // add HL, BC
+            IN(HL, BC);
+            OUT(HL, NH, C);
+            return frag_add(OPARG_HL, OPARG_BC, 0);
+            
+        case 0x0A:
+            // ld A, (BC)
+            IN(BC);
+            OUT(A);
+            break;
+            
+        case 0x0B:
+            // dec BC
+            IN(BC);
+            OUT(BC);
+            break;
+            
+        case 0x0C:
+            // inc c
+            IN(BC);
+            OUT(BC, Z, NH);
+            break;
+            
+        case 0x0D:
+            // dec c
+            IN(BC);
+            OUT(BC, Z, NH);
+            break;
+        
+        case 0x0E:
+            // ld C, i8
+            OUT(BC);
+            break;
+            
+        case 0x0F:
+            // rrca
+            IN(A, C);
+            OUT(A, Z, NH, C);
+            break;
+        
+        case 0x10: // STOP
+            break;
+            
+        case 0x11:
+            // ld de, i16
+            OUT(DE)
+            break;
+            
+        case 0x12:
+            // ld (DE), A
+            IN(DE, A);
+            break;
+            
+        case 0x13:
+            // inc DE
+            IN(DE);
+            OUT(DE);
+            break;
+            
+        case 0x14:
+            // inc D
+            IN(DE);
+            OUT(DE, Z, NH);
+            break;
+            
+        case 0x15:
+            // dec D
+            IN(DE);
+            OUT(DE, Z, NH);
+            break;
+            
+        case 0x16:
+            // ld D, i8
+            OUT(DE);
+            break;
+            
+        case 0x17:
+            // rla
+            IN(A);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0x18:
+            // jr
+            break;
+            
+        case 0x19:
+            // add hl, de
+            IN(HL, DE);
+            OUT(HL, NH, C);
+            break;
+            
+        case 0x1A:
+            // ld A, (DE)
+            IN(DE);
+            OUT(A);
+            break;
+            
+        case 0x1B:
+            // dec DE
+            IN(DE);
+            OUT(DE);
+            break;
+            
+        case 0x1C:
+            // inc E
+            IN(E);
+            OUT(E, Z, NH);
+            break;
+            
+        case 0x1D:
+            // dec E
+            IN(E);
+            OUT(E, Z, NH);
+            break;
+            
+        case 0x1E:
+            // ld E, i8
+            OUT(E);
+            break;
+            
+        case 0x1F:
+            // RRA
+            IN(A);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0x20:
+            // jr nz
+            IN(Z);
+            break;
+            
+        case 0x21:
+            // ld HL, i16
+            OUT(HL);
+            break;
+            
+        case 0x22:
+            // ld (HL+), A
+            IN(A, HL);
+            break;
+            
+        case 0x23:
+            // inc HL
+            IN(HL);
+            OUT(HL);
+            break;
+            
+        case 0x24:
+            // inc H
+            IN(H);
+            OUT(H, Z, NH);
+            break;
+            
+        case 0x25:
+            // dec H
+            IN(HL);
+            OUT(HL, Z, NH);
+            break;
+            
+        case 0x26:
+            // ld (HL), i8
+            IN(HL);
+            break;
+            
+        case 0x27:
+            // daa
+            IN(A, NH, C);
+            OUT(A, Z, NH, C); // technically, only H is modified.
+            break;
+            
+        case 0x28:
+            // jr z
+            IN(Z);
+            break;
+            
+        case 0x29:
+            // add HL, HL
+            IN(HL);
+            OUT(HL, NH, C);
+            break;
+            
+        case 0x2A:
+            // ld A, (HL+)
+            OUT(A);
+            IN(HL);
+            break;
+            
+        case 0x2B:
+            // dec HL
+            IN(HL);
+            OUT(HL);
+            break;
+            
+        case 0x2C:
+            // inc L
+            IN(HL);
+            OUT(HL, Z, NH);
+            return frag_inc(OPARG_L);
+            
+        case 0x2D:
+            // dec L
+            IN(HL);
+            OUT(HL, Z, NH);
+            break;
+            
+        case 0x2E:
+            // ld L, i8
+            OUT(HL);
+            break;
+            
+        case 0x2F:
+            IN(A);
+            OUT(A, NH);
+            break;
+            
+        case 0x30:
+            // jr nc
+            IN(C);
+            break;
+            
+        case 0x31:
+            // ld SP, i16
+            OUT(SP);
+            break;
+            
+        case 0x32:
+            // ld (HL-), A
+            IN(HL, A);
+            break;
+            
+        case 0x33:
+            // inc SP
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        case 0x34:
+            // inc (HL)
+            IN(HL);
+            OUT(Z, NH);
+            break;
+            
+        case 0x35:
+            // dec (HL)
+            IN(HL);
+            OUT(Z, NH);
+            break;
+            
+        case 0x36:
+            // ld HL, i8
+            OUT(HL);
+            break;
+            
+        case 0x37:
+            // scf
+            OUT(NH, C);
+            break;
+            
+        case 0x38:
+            // jr C
+            IN(C);
+            break;
+            
+        case 0x39:
+            // add HL, SP
+            IN(HL, SP);
+            OUT(SP, NH, C);
+            break;
+            
+        case 0x3A:
+            // ld A, (HL-)
+            IN(HL)
+            OUT(A);
+            break;
+            
+        case 0x3B:
+            // dec SP
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        case 0x3C:
+            // inc A
+            IN(A);
+            OUT(A, Z, NH);
+            break;
+            
+        case 0x3D:
+            // dec A
+            IN(A);
+            OUT(A, Z, NH);
+            break;
+            
+        case 0x3E:
+            // ld A, i8
+            OUT(A);
+            break;
+            
+        case 0x3F:
+            // ccf
+            IN(C);
+            OUT(NH, C);
+            break;
+        
+        // register transfer
+        case 0x40 ... 0x75:
+        case 0x77 ... 0x7F:
+            {
+                uint8_t opx = sm83_next_byte();
+                switch(opx%8)
+                {
+                case 0:
+                case 1:
+                    IN(BC);
+                    break;
+                case 2:
+                case 3:
+                    IN(DE);
+                    break;
+                case 4:
+                case 5:
+                case 6:
+                    IN(HL);
+                    break;
+                case 7:
+                    IN(A);
+                default:
+                    break;
+                }
+                switch(opx/8)
+                {
+                case 0:
+                case 1:
+                    OUT(BC);
+                    break;
+                case 2:
+                case 3:
+                    OUT(DE);
+                    break;
+                case 4:
+                case 5:
+                    OUT(HL);
+                    break;
+                case 7:
+                    OUT(A);
+                    break;
+                
+                default:
+                    break;
+                }
+            }
+            break;
+            
+        case 0x76: // HALT
+            break;
+            
+        // arithmetic
+        case 0x80 ... 0xBF:
+            {
+                OUT(A, Z, NH, C);
+                const uint8_t opx = sm83_next_byte();
+                switch (opx % 8)
+                {
+                case 0:
+                case 1:
+                    IN(BC);
+                    break;
+                case 2:
+                case 3:
+                    IN(DE);
+                    break;
+                case 4:
+                case 5:
+                case 6:
+                    IN(HL);
+                    break;
+                case 7:
+                    // ADD A takes A as input
+                    // but SUB A effectively does not (result is always the same).
+                    if (opx == 0x87 || opx == 0x8F || opx == 0xA7 || opx == 0xB7)
+                    {
+                        IN(A);
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+            break;
+        
+        case 0xC0:
+            // ret nz
+            // we do not consider SP because it appears specially in the epilogue.
+            IN(Z);
+            break;
+        
+        case 0xC1:
+            // pop bc
+            IN(SP);
+            OUT(SP, BC);
+            break;
+            
+        case 0xC2:
+            // jmp nz
+            IN(Z);
+            break;
+            
+        case 0xC3:
+            // jmp
+            break;
+            
+        case 0xC4:
+            // call nz
+            IN(SP, Z);
+            OUT(SP);
+            break;
+            
+        case 0xC5:
+            // push BC
+            IN(SP, BC);
+            OUT(SP);
+            break;
+            
+        case 0xC6:
+            // add A, i8
+            IN(A);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0xC7:
+            // rst 0
+            IN(SP);
+            OUT(SP);
+            break;
+        
+        case 0xC8:
+            // ret z
+            IN(Z);
+            // SP not considered -- see above
+            break;
+        
+        case 0xC9:
+            // ret
+            // SP not considered -- see above
+            break;
+            
+        case 0xCA:
+            // jmp z
+            IN(Z);
+            break;
+            
+        case 0xCB:
+            {
+                const bool bit = (op >= 0x40 && op < 0x80);
+                const uint8_t opx = sm83_next_byte();
+                switch(opx%8)
+                {
+                case 0:
+                case 1:
+                    IN(BC);
+                    if (!bit) OUT(BC);
+                    break;
+                case 2:
+                case 3:
+                    IN(DE);
+                    if (!bit) OUT(DE);
+                    break;
+                case 4:
+                case 5:
+                    IN(HL);
+                    if (!bit) OUT(HL);
+                    break;
+                case 6:
+                    IN(HL);
+                    break;
+                case 7:
+                    IN(A);
+                    if (!bit) OUT(A);
+                }
+                
+                if (opx < 0x80)
+                {
+                    OUT(Z, NH);
+                    if (!bit) OUT(C);
+                    if (opx >= 0x10 && opx < 0x20)
+                    {
+                        IN(C);
+                    }
+                }
+            }
+            break;
+            
+        case 0xCC:
+            // call Z
+            IN(SP, Z);
+            OUT(SP);
+            break;
+            
+        case 0xCD:
+            // call
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        case 0xCE:
+            // adc a, i8
+            IN(A, C);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0xCF:
+            // rst 1
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        case 0xD0:
+            // ret nc
+            IN(C);
+            break;
+        
+        case 0xD1:
+            // pop DE
+            IN(SP);
+            OUT(DE, SP);
+            break;
+            
+        case 0xD2:
+            // jp nc
+            IN(C);
+            break;
+            
+        case 0xD4:
+            // call nc
+            IN(C, SP);
+            OUT(SP);
+            break;
+            
+        case 0xD5:
+            // push de
+            return frag_push(OPARG_DE);
+            
+        case 0xD6:
+            // sub a, i8
+            IN(A);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0xD7:
+            // rst 2
+            IN(SP);
+            OUT(SP);
+            break;
+        
+        case 0xD8:
+            // ret c
+            IN(C);
+            break;
+        
+        case 0xD9:
+            // reti
+            break;
+            
+        case 0xDA:
+            // jmp c
+            IN(C);
+            break;
+            
+        case 0xDC:
+            // call c
+            IN(C, SP);
+            OUT(SP);
+            break;
+            
+        case 0xDE:
+            // sbc A, i8
+            IN(A, C);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0xDF:
+            // rst 3
+            IN(SP);
+            OUT(SP)
+            break;
+            
+        case 0xE0:
+            // ld (i8), A
+            IN(A);
+            break;
+            
+        case 0xE1:
+            // pop HL
+            IN(SP);
+            OUT(SP, HL);
+            break;
+            
+        case 0xE2:
+            // ld (C), A
+            IN(A, BC);
+            break;
+            
+        case 0xE5:
+            OUT(HL);
+            break;
+            
+        case 0xE6:
+            // and i8
+            IN(A);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0xE7:
+            // rst 4
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        case 0xE8:
+            // add SP, i8
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        case 0xE9:
+            // jmp HL
+            IN(HL);
+            break;
+            
+        case 0xEA:
+            // ld (i16), A
+            IN(A);
+            break;
+            
+        case 0xEE:
+            // xor i8
+            IN(A);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0xEF:
+            // rst 5
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        case 0xF0:
+            // ld A, (i8)
+            OUT(A);
+            break;
+            
+        case 0xF1:
+            // pop AF
+            IN(SP);
+            OUT(A, SP);
+            
+        case 0xF2:
+            // ld A, (C)
+            IN(C);
+            OUT(A);
+            break;
+            
+        case 0xF3:
+            // di
+            break;
+            
+        case 0xF5:
+            // push AF
+            IN(A, SP);
+            OUT(SP);
+            break;
+            
+        case 0xF6:
+            // or i8
+            IN(A);
+            OUT(A, Z, NH, C);
+            break;
+            
+        case 0xF7:
+            // rst 6
+            IN(PC);
+            OUT(pC);
+            break;
+            
+        case 0xF8:
+            // ld HL, SP+i8
+            IN(SP);
+            OUT(HL);
+            break;
+            
+        case 0xF9:
+            // ld SP, HL
+            IN(HL);
+            OUT(SP);
+            break;
+            
+        case 0xFA:
+            // ld A, (i16)
+            OUT(A);
+            break;
+            
+        case 0xFB:
+            // ei
+            break;
+            
+        case 0xFD:
+            // cp i8
+            IN(A);
+            OUT(Z, NH, C);
+            break;
+            
+        case 0xFF:
+            // rst 7
+            IN(SP);
+            OUT(SP);
+            break;
+            
+        default:
+            break;
+    }
 }
 
 static void disassemble_instruction(void)
