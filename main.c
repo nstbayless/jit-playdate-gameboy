@@ -43,6 +43,16 @@ static const uint8_t gbrom_memaccess[] = {
 	0x10, 				// stop
 };
 
+static const uint8_t gbrom_bitmath[] = {
+	0x21, 0x00, 0xC0,  // ld hl, $C000
+	0x3E, 0x85,        // ld a, $85
+	0xB6,              // or (hl)
+	0x47,              // ld b, a
+	0xEE, 0x10,        // xor a, $90
+	0x4f,              // ld c, a
+	0xAF,              // xor a, a
+};
+
 static void test_stop(void)
 {
 	halt = 1;
@@ -192,7 +202,7 @@ int eventHandler
 		do_test(gbrom_ld);
 		
 		#ifdef TARGET_PLAYDATE
-		playdate->system->logToConsole("register a: %4X", regs.a);
+		playdate->system->logToConsole("register a:  %2X", regs.a);
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
@@ -204,7 +214,7 @@ int eventHandler
 		playdate->system->logToConsole("Transfer:");
 		do_test(gbrom_transfer);
 		#ifdef TARGET_PLAYDATE
-		playdate->system->logToConsole("register a: %4X", regs.a);
+		playdate->system->logToConsole("register a:  %2X", regs.a);
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
@@ -218,14 +228,26 @@ int eventHandler
 		playdate->system->logToConsole("Mem Access:");
 		do_test(gbrom_memaccess);
 		#ifdef TARGET_PLAYDATE
-		playdate->system->logToConsole("register a: %4X", regs.a);
+		playdate->system->logToConsole("register a:  %2X", regs.a);
 		playdate->system->logToConsole("register bc: %4X", regs.bc);
 		playdate->system->logToConsole("register de: %4X", regs.de);
 		playdate->system->logToConsole("register hl: %4X", regs.hl);
 		
 		jit_assert(regs.a == 0x30);
 		jit_assert(wram[0] == 0x30);
-		jit_assert(1==2);
+		#endif
+		
+		playdate->system->logToConsole("Bit Math:");
+		do_test(gbrom_memaccess);
+		#ifdef TARGET_PLAYDATE
+		playdate->system->logToConsole("register a:  %2X", regs.a);
+		playdate->system->logToConsole("register bc: %4X", regs.bc);
+		playdate->system->logToConsole("register de: %4X", regs.de);
+		playdate->system->logToConsole("register hl: %4X", regs.hl);
+		
+		jit_assert(regs.a == 0x0);
+		jit_assert(regs.bc == 0xD525);
+		jit_assert(regs.z == 0);
 		#endif
 	}
 	return 0;

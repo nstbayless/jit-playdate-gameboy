@@ -136,7 +136,7 @@ static uint32_t bit(uint32_t src, uint32_t idx)
 #define OPREGSEP8 MAP_LIST(OPREGSEPM, 0, 1, 2, 3, 4, 5, 6, 7)
 #define OPREGSEP16 MAP_LIST(OPREGSEPM, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
-#define IMM5_RD_RM(u) bits(u, 6, 5), bits(u, 0, 4), bits(u, 4, 4)
+#define IMM5_RD_RM(u) bits(u, 6, 5), bits(u, 0, 3), bits(u, 3, 4)
 
 const char* tmpxint(uint32_t i)
 {
@@ -681,15 +681,21 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             // A6-266 SBFX
             return prop("SBFX" TODO);
         case 0b10110:
-            if (rn != 0xF)
             {
-                // A6-43 BFI
-                return prop("BFI" TODO);
-            }
-            else
-            {
-                // A6-42 BFC
-                return prop("BFC" TODO);
+                uint8_t msb = bits(arm, 0, 5);
+                uint8_t lsb = bits(arm, 6, 2) | (bits(arm, 12, 3) << 2);
+                uint8_t width = msb-lsb+1;
+                uint8_t rd = bits(arm, 8, 4);
+                if (rn != 0xF)
+                {
+                    // A6-43 BFI
+                    return prop("BFI %s, %s, #%d, #%d", rname(rd), rname(rn), (int)lsb, (int)width);
+                }
+                else
+                {
+                    // A6-42 BFC
+                    return prop("BFC %s, #%d, %d", rname(rd), (int)lsb, (int)width);
+                }
             }
             break;
         case 0b11100:
@@ -994,6 +1000,7 @@ static int decode_16_misc(const uint16_t arm, uintptr_t base)
     }
     else if (BITMATCH(opcode, 1, 1, 1, 1, x, x, x))
     {
+        if (arm == 0xbf00) return prop("NOP");
         return 0; // A5-11 IT
     }
     
