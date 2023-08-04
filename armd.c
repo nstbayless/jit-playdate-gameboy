@@ -263,7 +263,6 @@ static uint16_t imm16_0_12_26_16(uint32_t arm)
 }
 
 
-#define RNOFF1 1
 #define EXPAND12C 6
 #define EXPAND12 4
 
@@ -286,11 +285,10 @@ static int decode_op32_S20_rd8_imm12_0_12_10(const char* name, uint32_t arm, int
     return prop("%s%s %s,%s", name, SSFLAG(setflags), rname(rd), imm);
 }
 
-static int decode_op32_s20_rn8_rd16_imm12_0_12_26(const char* name, uint32_t arm, int flags)
+static int decode_op32_s20_rd8_rn16_imm12_0_12_26(const char* name, uint32_t arm, int flags)
 {
-    int rnoff = !!(flags & RNOFF1);
     uint8_t rd = bits(arm, 8, 4);
-    uint8_t rn = bits(arm, 16+rnoff, 4);
+    uint8_t rn = bits(arm, 16, 4);
     uint16_t imm12 = imm12_0_12_26(arm);
     uint8_t setflags = bit(arm, 20);
     if (rd == 13 || rd == 15 || rn == 13) return 0;
@@ -322,26 +320,6 @@ static int decode_op32_rd_rn_rmshift(const char* name, uint32_t arm)
     
     prop("%s%s.W %s, %s, %s", name, SSFLAG(setflags), rname(rd), rname(rn), regshift(rm, type, imm5));
     return 1;
-}
-
-static int decode_imm_shift(uint8_t shift_type, uint8_t imm5, uint8_t rd, uint8_t rm)
-{
-    switch(shift_type & 3)
-    {
-    case 0:
-        return prop("LSL %s, %s, %d", rname(rd), rname(rm), imm5);
-    case 1:
-        return prop("LSR %s, %s, %d", rname(rd), rname(rm), imm5 == 0 ? 32 : imm5);
-    case 2:
-        return prop("ASR %s, %s, %d", rname(rd), rname(rm), imm5 == 0 ? 32 : imm5);
-    case 3:
-        if (imm5 == 0)
-            return prop("RRX %s, %s, 1", rname(rd), rname(rm));
-        else
-            return prop("ROR %s, %s, %d", rname(rd), rname(rm), imm5);
-    }
-    
-    return 0;
 }
 
 static int decode_32(const uint32_t arm, uintptr_t base)
@@ -557,7 +535,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             if (rd != 0xF)
             {
                 // A6-32 AND (imm)
-                return decode_op32_s20_rn8_rd16_imm12_0_12_26("AND", arm, EXPAND12C);
+                return decode_op32_s20_rd8_rn16_imm12_0_12_26("AND", arm, EXPAND12C);
             }
             else
             {
@@ -570,7 +548,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             if (rn != 0xF)
             {
                 // A6-172 ORR (imm)
-                return decode_op32_s20_rn8_rd16_imm12_0_12_26("ORR", arm, EXPAND12C);
+                return decode_op32_s20_rd8_rn16_imm12_0_12_26("ORR", arm, EXPAND12C);
             }
             else
             {
@@ -581,7 +559,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             if (rn != 0xF)
             {
                 // A6-168 ORN (imm)
-                return decode_op32_s20_rn8_rd16_imm12_0_12_26("ORN", arm, EXPAND12C);
+                return decode_op32_s20_rd8_rn16_imm12_0_12_26("ORN", arm, EXPAND12C);
             }
             else
             {
@@ -591,8 +569,8 @@ static int decode_32(const uint32_t arm, uintptr_t base)
         case 0b0100:
             if (rd != 0xF)
             {
-                // A6-72 EOR
-                return decode_op32_s20_rn8_rd16_imm12_0_12_26("EOR", arm, EXPAND12C | RNOFF1);
+                // A6-72 EOR (imm)
+                return decode_op32_s20_rd8_rn16_imm12_0_12_26("EOR", arm, EXPAND12C);
             }
             else
             {
@@ -603,7 +581,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             if (rd != 0xF)
             {
                 // A6-22 ADD (imm) T3
-                decode_op32_s20_rn8_rd16_imm12_0_12_26("ADD", arm, EXPAND12);
+                decode_op32_s20_rd8_rn16_imm12_0_12_26("ADD", arm, EXPAND12);
             }
             else
             {
@@ -612,15 +590,15 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             }
         case 0b1010:
             // A6-18 ADC
-            return prop("ADC" TODO);
+            return decode_op32_s20_rd8_rn16_imm12_0_12_26("ADC", arm, EXPAND12);
         case 0b1011:
             // A6-204 SBC
-            return prop("SBC" TODO);
+            return decode_op32_s20_rd8_rn16_imm12_0_12_26("SBC", arm, EXPAND12);
         case 0b1101:
             if (rd != 0xF)
             {
-                // A6-244 SUB
-                return prop("SUB" TODO);
+                // A6-244 SUB [T3]
+                return decode_op32_s20_rd8_rn16_imm12_0_12_26("SUB", arm, EXPAND12);
             }
             else
             {
@@ -636,15 +614,20 @@ static int decode_32(const uint32_t arm, uintptr_t base)
     else if (BITMATCH(opcode, 1, 0,   x, 1, x, x,  x, x, x,   0))
     {
         // data processing (plain binary immediate) A5-17
-        uint8_t op = bits(arm, 20, 5);
-        uint8_t rn = bits(arm, 16, 4);
+        const uint8_t op = bits(arm, 20, 5);
+        const uint8_t rn = bits(arm, 16, 4);
+        const uint8_t rd = bits(arm, 8, 4);
+        
+        const uint8_t bfx_width = bits(arm, 0, 5)+1;
+        const uint8_t bfx_imm5 = (bits(arm, 6, 2)) | (bits(arm, 12, 3) << 2);
+        
         switch (op)
         {
         case 0b00000:
             if (rn != 0xF)
             {
                 // A6-22 ADD (imm) T4
-                return decode_op32_s20_rn8_rd16_imm12_0_12_26("ADDW", arm, 0);
+                return decode_op32_s20_rd8_rn16_imm12_0_12_26("ADDW", arm, 0);
             }
             else
             {
@@ -656,7 +639,6 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             // A6-148 MOV (imm) T3 16-bit
             {
                 uint32_t imm16 = imm16_0_12_26_16(arm);
-                uint8_t rd = bits(arm, 8, 4);
                 return prop("MOVW %s,#$%04x", rname(rd), imm16);
             }
         case 0b01010:
@@ -674,18 +656,16 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             // A6-153 MOVT (16-bit)
             {
                 uint32_t imm16 = imm16_0_12_26_16(arm);
-                uint8_t rd = bits(arm, 8, 4);
                 return prop("MOVT %s,#$%04x", rname(rd), imm16);
             }
         case 0b10100:
             // A6-266 SBFX
-            return prop("SBFX" TODO);
+            return prop("SBFX %s, %s, #%d, #%d", rname(rd), rname(rn), (int)bfx_imm5, (int)bfx_width);
         case 0b10110:
             {
                 uint8_t msb = bits(arm, 0, 5);
                 uint8_t lsb = bits(arm, 6, 2) | (bits(arm, 12, 3) << 2);
                 uint8_t width = msb-lsb+1;
-                uint8_t rd = bits(arm, 8, 4);
                 if (rn != 0xF)
                 {
                     // A6-43 BFI
@@ -700,8 +680,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             break;
         case 0b11100:
             // A6-266 UBFX
-            return prop("UBFX" TODO);
-            break;
+            return prop("UBFX %s, %s, #%d, #%d", rname(rd), rname(rn), (int)bfx_imm5, (int)bfx_width);
         }
     }
     else if (BITMATCH(opcode, 1, 0,   x, x, x, x,  x, x, x,   1))
@@ -790,7 +769,50 @@ static int decode_32(const uint32_t arm, uintptr_t base)
     else if (BITMATCH(opcode, 1, 1,   0, 1, 0, x,  x, x, x,   x))
     {
         // A5-28 data processing (reg)
-        return prop(TODO "[A5-28]");
+        const uint8_t rm = bits(arm, 0, 4);
+        const uint8_t rd = bits(arm, 8, 4);
+        const uint8_t rn = bits(arm, 16, 4);
+        const uint8_t op2 = bits(arm, 4, 4);
+        if (op2 == 0)
+        {
+            const uint8_t op = bits(arm, 21, 3);
+            switch (op)
+            {
+            case 0b000:
+                // A6-136 LSL (reg)
+                return prop("LSL %s, %s, %s", rname(rd), rname(rn), rname(rm));
+            case 0b001:
+                // A6-140 LSR (reg)
+                return prop("LSR %s, %s, %s", rname(rd), rname(rn), rname(rm));
+            case 0b010:
+                // A6-38 ASR (reg)
+                return prop("ASR %s, %s, %s", rname(rd), rname(rn), rname(rm));
+            case 0b011:
+                return prop("ROR %s, %s, %s", rname(rd), rname(rn), rname(rm));
+            }
+        }
+        else if (bit(op2, 3))
+        {
+            const uint8_t op1 = bits(arm, 20, 4);
+            switch (op1)
+            {
+                case 0b0000:
+                    return prop("sxth %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                case 0b0001:
+                    return prop("uxth %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                case 0b0100:
+                    return prop("sxtb %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                case 0b0101:
+                    return prop("uxtb %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                case 0b1000 ... 0b1011:
+                    if (!bit(op2, 2))
+                    {
+                        // A5-29 miscellaneous
+                        return prop("UNK [A5-29]");
+                    }
+                    break;
+            }
+        }
     }
     else if (BITMATCH(opcode, 1, 1,   0, 1, 1, 0,  x, x, x,   x))
     {
@@ -857,51 +879,71 @@ static int decode_16_datap(const uint16_t arm, uintptr_t base)
 
 static int decode_16_arith(const uint16_t arm, uintptr_t base)
 {
+    // A5-5
     assert(arm >> 14 == 0);
     const uint16_t opcode = (arm >> 9) & 0b0011111;
+    uint8_t rd = bits(arm, 0, 3);
+    uint8_t rn = bits(arm, 3, 3);
     
     switch (opcode)
     {
-    case 0b00000:
-    case 0b00001:
-    case 0b00010:
-    case 0b00011:
-        // A6-134 lsl
-        return decode_imm_shift(0, IMM5_RD_RM(arm));
-    case 0b00100:
-    case 0b00101:
-    case 0b00110:
-    case 0b00111:
-        // A6-138 lsr
-        return decode_imm_shift(1, IMM5_RD_RM(arm));
-    case 0b01000:
-    case 0b01001:
-    case 0b01010:
-    case 0b01011:
-        // A6-36 asr
-        return decode_imm_shift(0, IMM5_RD_RM(arm));
-    case 0b01100:
-        // A6-24 add
+    case 0b00000 ... 0b01011:
         {
+            uint8_t imm = bits(arm, 6, 5);
+            if (imm == 0)
+            {
+                imm = 32;
+            }
             
+            switch (bits(arm, 11, 2))
+            {
+            case 0:
+                // A6-134 lsl
+                if (imm == 32)
+                {
+                    return prop("MOV %s, %s", rname(rd), rname(rn));
+                }
+                else
+                {
+                    return prop("LSL %s, %s, #%d", rname(rd), rname(rn), (int)imm);
+                }
+                break;
+            case 1:
+                // A6-138 lsr
+                return prop("LSR %s, %s, #%d", rname(rd), rname(rn), (int)imm);
+                break;
+            case 2:
+                // A6-36  asr
+                return prop("ASR %s, %s, #%d", rname(rd), rname(rn), (int)imm);
+                break;
+            }
+        }
+        break;
+    case 0b01100:
+        // A6-24 add (reg) [T1]
+        {
+            const uint8_t rm = bits(arm, 6, 3);
+            return prop("ADDS %s, %s, %s", rname(rd), rname(rn), rname(rm));
         }
         break;
     case 0b01101:
-        // A6-246 sub
+        // A6-246 sub (reg)
         {
+            const uint8_t rm = bits(arm, 6, 3);   
+            return prop("SUBS %s, %s, %s", rname(rd), rname(rn), rname(rm));
         }
         break;
     case 0b01110:
         // A6-22 add 3-bit imm
         {
             uint8_t imm3 = bits(arm, 6, 3);
-            uint8_t rn = bits(arm, 3, 3);
-            uint8_t rd = bits(arm, 0, 3);
             return prop("ADDS %s,%s,%02x", rname(rd), rname(rn), imm3);
         }
     case 0b01111:
-        // A6-244 subtract 3-bit imm
+        // A6-244 subtract 3-bit imm [T1]
         {
+            uint8_t imm3 = bits(arm, 6, 3);
+            return prop("SUBS %s,%s,%02x", rname(rd), rname(rn), imm3);
         }
         break;
     case 0b10000:
@@ -910,9 +952,9 @@ static int decode_16_arith(const uint16_t arm, uintptr_t base)
     case 0b10011:
         // A6-148 mov
         {
-            uint8_t rd = bits(arm, 8, 3);
-            uint32_t imm8 = bits(arm, 0, 8);
-            return prop("MOVS %s, #$%02x", rname(rd), imm8);
+            const uint8_t rd = bits(arm, 8, 3);
+            const uint8_t imm8 = bits(arm, 0, 8);
+            return prop("MOVS %s, #$%02x", rname(rd), (unsigned int)imm8);
         }
         break;
     case 0b10100:
@@ -921,24 +963,31 @@ static int decode_16_arith(const uint16_t arm, uintptr_t base)
     case 0b10111:
         // A6-62 cmp
         {
-            
+            return prop("CMP [TODO] [A6-62]");
         }
         break;
     case 0b11000:
     case 0b11001:
     case 0b11010:
     case 0b11011:
-        // A6-22 add 8-bit imm
+        // A6-22 add 8-bit imm [T2]
         {
+            const uint8_t rdn = bits(arm, 8, 3);
+            const uint8_t imm = bits(arm, 0, 8);
+            return prop("ADDS %s, %02X", rname(rdn), (int)imm);
         }
         break;
     case 0b11100:
     case 0b11101:
     case 0b11110:
     case 0b11111:
-        // A6-244 sub 8-bit imm
+        // A6-244 sub 8-bit imm [T2]
         {
+            const uint8_t rdn = bits(arm, 8, 3);
+            const uint8_t imm = bits(arm, 0, 8);
+            return prop("SUBS %s, %02X", rname(rdn), (int)imm);
         }
+        break;
         break;
     }
     
@@ -1169,33 +1218,41 @@ static int decode_16(const uint16_t arm, uintptr_t base)
             // A5-7 data processing
             return decode_16_datap(arm, base);
         case 0b010001:
-            // A5-4 special data instructions
-            switch ((arm >> 6) & 0x0f)
             {
-            case 0b0000:
-            case 0b0001:
-            case 0b0010:
-            case 0b0011:
-                // A6-24 ADD (reg)
-                break;
-            case 0b0101:
-            case 0b0110:
-            case 0b0111:
-                // A6-64 CMP (reg)
-                break;
-            case 0b1000:
-            case 0b1001:
-            case 0b1010:
-            case 0b1011:
-                // A6-150 MOV (reg)
-                break;
-            case 0b1100:
-            case 0b1101:
-                // A6-51 BX
-            case 0b1110:
-            case 0b1111:
-                // A6-50 BLX
-                return decode_bx_16(arm, base);
+                const uint8_t rd = bits(arm, 0, 3) | (bit(arm, 7) << 3);
+                const uint8_t rm = bits(arm, 3, 4);
+                
+                // A5-4 special data instructions
+                switch ((arm >> 6) & 0x0f)
+                {
+                case 0b0000:
+                case 0b0001:
+                case 0b0010:
+                case 0b0011:
+                    // A6-24 ADD (reg) [T1]
+                    return prop("ADD %s, %s", rname(rd), rname(rm));
+                case 0b0101:
+                case 0b0110:
+                case 0b0111:
+                    // A6-64 CMP (reg)
+                    return prop("CMP %s, %s", rname(rd), rname(rm));
+                    break;
+                case 0b1000:
+                case 0b1001:
+                case 0b1010:
+                case 0b1011:
+                    // A6-150 MOV (reg)
+                    return prop("MOV %s, %s", rname(rd), rname(rm));
+                    break;
+                case 0b1100:
+                case 0b1101:
+                    // A6-51 BX
+                    // [[fallthrough]]
+                case 0b1110:
+                case 0b1111:
+                    // A6-50 BLX
+                    return decode_bx_16(arm, base);
+                }
             }
             break;
         case 0b010010:

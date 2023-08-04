@@ -169,3 +169,33 @@ X12, X11, X10, X9, X8, X7, X6, X5, X4, X3, X2, X1, N, ...) N
 #define FOLD_31(M, ...) FOLD_31_(M,(M FIRSTTWOARG __VA_ARGS__, EXPAND(REMOVEBRACKET RESTTWOARG __VA_ARGS__)))
 #define FOLD_32_(M, ...) FOLD_31(M,__VA_ARGS__)
 #define FOLD_32(M, ...) FOLD_32_(M,(M FIRSTTWOARG __VA_ARGS__, EXPAND(REMOVEBRACKET RESTTWOARG __VA_ARGS__)))
+
+#define REPEAT_256_TIMES(...) \
+    REPEAT_128_TIMES(__VA_ARGS__) \
+    REPEAT_128_TIMES(__VA_ARGS__)
+
+#define REPEAT_128_TIMES(...) \
+    REPEAT_64_TIMES(__VA_ARGS__) \
+    REPEAT_64_TIMES(__VA_ARGS__)
+
+#define REPEAT_64_TIMES(...) \
+    REPEAT_32_TIMES(__VA_ARGS__) \
+    REPEAT_32_TIMES(__VA_ARGS__)
+    
+#define REPEAT_32_TIMES(...) \
+    REPEAT_16_TIMES(__VA_ARGS__) \
+    REPEAT_16_TIMES(__VA_ARGS__)
+    
+#define REPEAT_16_TIMES(...) \
+    REPEAT_8_TIMES(__VA_ARGS__) \
+    REPEAT_8_TIMES(__VA_ARGS__)
+
+#define REPEAT_8_TIMES(...) \
+    REPEAT_4_TIMES(__VA_ARGS__) \
+    REPEAT_4_TIMES(__VA_ARGS__)
+
+#define REPEAT_4_TIMES(...) \
+    REPEAT_2_TIMES(__VA_ARGS__) \
+    REPEAT_2_TIMES(__VA_ARGS__)
+    
+#define REPEAT_2_TIMES(...) __VA_ARGS__ __VA_ARGS__

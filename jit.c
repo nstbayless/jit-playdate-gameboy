@@ -1,6 +1,7 @@
 #include "jit.h"
 #include "armd.h"
 #include "sm38d.h"
+#include "map.h"
 
 /*
     Useful resources when developing this JIT:
@@ -61,8 +62,9 @@
 
 /*
     OPTIMIZATION IDEAS
+    - we can combine multiple rotate instructions in a row
     - these sm83 commands don't exist: ld bc,hl; ld de,bc; and so on.
-        - they are emulated in sm83 by instruction pairs e.g. push hl, pop bc; ld b,h; ld c, l
+        - they are emulated in sm83 by instruction pairs e.g. ld b,h; ld c, l
         - we can identify this and reduce to just one arm mov instruction.
         
     - we can analyze the rst routines and inline them
@@ -72,6 +74,8 @@
       most of the time.
       
     -if writeword takes a uint_32 instead of uint16_t, we can avoid the uxth
+    
+    - sm83 rotate instructions can be improved a lot by leveraging the arm bfi instruction.
 */
 
 #ifndef JIT_DEBUG
@@ -81,11 +85,6 @@
 #define SETFLAGS 1
 
 #ifdef TARGET_PLAYDATE
-    #ifdef __FPU_USED
-        #undef __FPU_USED
-    #endif
-    #define STM32F746xx
-    #include "stm32f7xx.h" 
     #define assert(_B) jit_assert_pd(_B, opts.playdate)
 #else
     #include <assert.h>
@@ -108,9 +107,14 @@
 #define JIT_START_PADDING_ENTRY_C 10
 
 #ifdef JIT_DEBUG
-#define JIT_DEBUG_MESSAGE(...) do {opts.playdate->system->logToConsole(__VA_ARGS__); spin();} while(0)
+    #ifdef TARGET_QEMU
+        extern void _printf(const char* fmt, ...);
+        #define JIT_DEBUG_MESSAGE(fmt, ...) _printf(fmt "\n", ##__VA_ARGS__)
+    #else
+        #define JIT_DEBUG_MESSAGE(...) do {opts.playdate->system->logToConsole(__VA_ARGS__); spin();} while(0)
+    #endif
 #else
-#define JIT_DEBUG_MESSAGE(...)
+    #define JIT_DEBUG_MESSAGE(...)
 #endif
 
 #ifdef ADC
@@ -187,8 +191,10 @@
 #define THUMB32_SUB_IMM_T3 0xf1A00000
 #define THUMB32_SUB_IMM_T4 0xf2A00000
 #define THUMB32_BFI     0xf3600000
-#define THUMB32_UXTH    0xfa1ff000
-#define THUMB32_UXTB    0xfa5ff000
+#define THUMB32_SXTH    0xfa0ff080
+#define THUMB32_UXTH    0xfa1ff080
+#define THUMB32_SXTB    0xfa4ff080
+#define THUMB32_UXTB    0xfa5ff080
 
 // all sm83 registers
 #define REGS_SM83 ((1 << REG_A) | (1 << REG_BC) | (1 << REG_DE) | (1 << REG_HL) | (1 << REG_SP) | (1 << REG_Carry) | (1 << REG_nZ) | (1 << REG_NH))
@@ -233,7 +239,7 @@ static jit_ht_entry* jit_hashtable[JIT_HASHTABLE_SIZE];
 
 static void* arm_interworking_none(void* addr)
 {
-	#ifdef TARGET_PLAYDATE
+	#ifdef __arm__
 	return (void*)((uintptr_t)addr & ~1);
 	#else
 	return addr;
@@ -242,7 +248,7 @@ static void* arm_interworking_none(void* addr)
 
 static void* arm_interworking_thumb(void* fn)
 {
-    #if TARGET_PLAYDATE
+    #ifdef __arm__
     return (void*)((uintptr_t)fn | 1);
     #else
     return fn;
@@ -381,7 +387,7 @@ static struct {
 
     unsigned done : 1;
     unsigned error : 1;
-    unsigned use_lr : 1;
+    unsigned use_lr : 1; // (unused, actually)
     
     // 0: leave as-is
     // 1: clear
@@ -668,8 +674,46 @@ static uint8_t fasm_bl(void* fn, uint16_t* outbuff)
 {
     WRITE_BUFF_INIT();
     
+    const uint32_t base_addr_none = (uintptr_t)arm_interworking_none(fn);
+    const uint32_t base_addr_thumb = (uintptr_t)arm_interworking_thumb(fn);
+    
+    #ifdef TARGET_QEMU
+    
+    assert(sizeof(void*) == sizeof(uint32_t));
+    const uint32_t imm32 = base_addr_thumb;
+    
+    // movw
+    const unsigned dstidx = 14;
+    const uint16_t immlo = imm32 & 0xFFFFFFFF;
+    WRITE_BUFF_32(
+        0xf2400000
+        | (dstidx << 8)
+        | (bits(immlo, 0, 8) << 0)
+        | (bits(immlo, 8, 3) << 12)
+        | (bits(immlo, 11, 1) << 26)
+        | (bits(immlo, 12, 4) << 16)
+    );
+    
+    // movt
+    const uint16_t immhi = imm32 >> 16;
+    WRITE_BUFF_32(
+        0xf2c00000
+        | (dstidx << 8)
+        | (bits(immhi, 0, 8) << 0)
+        | (bits(immhi, 8, 3) << 12)
+        | (bits(immhi, 11, 1) << 26)
+        | (bits(immhi, 12, 4) << 16)
+    );
+    
+    // blx lr
+    WRITE_BUFF_16(
+        0x4780 | (14 << 3)
+    );
+    
+    #else
+    
     // bl fn
-    int32_t rel_addr = ((intptr_t)arm_interworking_none(fn) - (intptr_t)outbuff) / 2 - 2;
+    int32_t rel_addr = (base_addr_none - (intptr_t)outbuff) / 2 - 2;
     uint32_t urel_addr = rel_addr;
     uint32_t sign = rel_addr < 0
         ? (1 << 26)
@@ -680,13 +724,16 @@ static uint8_t fasm_bl(void* fn, uint16_t* outbuff)
     uint32_t j1 = (!(urel_addr & (1 << 21)) == !sign)
         ? 0x2000
         : 0x0000;
-        
     
     #ifdef TARGET_PLAYDATE
-    if ((int)urel_addr < -16777216 || (int)urel_addr > 16777214)
+    if (outbuff)
     {
-        // shouldn't be possible -- playdate's memory is only 16 mb.
-        assert(false);
+        if ((int)urel_addr < -16777216 || (int)urel_addr > 16777214)
+        {
+            // shouldn't be possible -- playdate's memory is only 16 mb.
+            JIT_DEBUG_MESSAGE("bl out of range... %lx from %lx to %lx", abs(urel_addr), outbuff, fn);
+            assert(false);
+        }
     }
     #endif
     
@@ -697,43 +744,9 @@ static uint8_t fasm_bl(void* fn, uint16_t* outbuff)
     WRITE_BUFF_32(
         0xF000D000 | (urel_addr & 0x7ff) | ((urel_addr << 5) & 0x03ff0000) | j2 | j1 | sign
     );
+    #endif
     
     return WRITE_BUFF_END();
-}
-
-// call function directly.
-static uint8_t fasm_delegate(void* fn, uint16_t* outbuff)
-{
-    WRITE_BUFF_INIT();
-    
-    // only need to save registers r0-r3
-    // registers r4+ are callee-saved
-    uint32_t reg_push = REGS_NONFLEX & 0xF;
-    
-    // push {...}
-    if (reg_push)
-    {
-        WRITE_BUFF_16(reg_push | 0xb400);
-    }
-    
-    outbuff += fasm_bl(fn, FWD_BUFF());
-    
-    if (reg_push)
-    {
-        // pop {...}
-        WRITE_BUFF_16(reg_push | 0xbc00);
-    }
-    
-    return WRITE_BUFF_END();
-}
-
-static void frag_delegate(fn_type fn)
-{
-    dis.use_lr = 1;
-    dis.frag[dis.fragc++] = FRAG(
-        .args = (void*)fn,
-        .produce = fasm_delegate
-    );
 }
 
 static void frag_bl(fn_type fn)
@@ -743,6 +756,23 @@ static void frag_bl(fn_type fn)
         .args = (void*)fn,
         .produce = fasm_bl
     );
+}
+
+static void frag_delegate(fn_type fn)
+{
+    uint32_t reg_push = REGS_NONFLEX & 0xF;
+    
+    if (reg_push)
+    {
+        frag_instr16(reg_push | 0xb400);
+    }
+    
+    frag_bl(fn);
+    
+    if (reg_push)
+    {
+        frag_instr16(reg_push | 0xbc00);
+    }
 }
 
 // see ThumbExpand_C
@@ -912,7 +942,7 @@ static void frag_armpop(uint16_t regs)
     if (!bits(regs, 8, 4) && !bit(regs, 14))
     {
         // pop { regs }
-        frag_instr16(regs | 0xbd00);
+        frag_instr16(regs | 0xbc00);
     }
     else
     {
@@ -964,6 +994,22 @@ static void frag_ld_imm16(int dstidx, uint16_t imm)
     }
 }
 
+static void frag_ld_imm32(int dstidx, uint32_t imm)
+{
+    frag_ld_imm16(dstidx, imm & 0xFFFF);
+    uint16_t immt = imm >> 16;
+    
+    // MOVT r%dst, imm16
+    frag_instr32(
+        0xf2c00000
+        | (dstidx << 8)
+        | (bits(imm, 0, 8) << 0)
+        | (bits(imm, 8, 3) << 12)
+        | (bits(imm, 11, 1) << 26)
+        | (bits(imm, 12, 4) << 16)
+    );
+}
+
 static void frag_access_multiple(bool store, uint16_t regs, uint8_t ptrreg)
 {
     const uint16_t op16 = (store)
@@ -992,11 +1038,11 @@ static void frag_mov_rd_rm(
     uint8_t rd, uint8_t rm
 )
 {
-    if (rd >= 0x10 || rm >= 0x10)
+    if (rd >= 8 || rm >= 8)
     {
         frag_instr16(
             THUMB16_MOV_REG_T2
-            | (rm << 4)
+            | (rm << 3)
             | (bits(rd, 0, 3))
             | (bit(rd, 3) << 7)
         );
@@ -1016,11 +1062,12 @@ static void frag_ubfx(
     uint8_t width
 )
 {
-    frag_instr16(
+    assert(width > 0);
+    frag_instr32(
         0xf3c00000
         | (rd << 8)
         | (rn << 16)
-        | (width & 0b11111)
+        | ((width-1) & 0b11111)
         | (bits(pos, 0, 2) << 6)
         | (bits(pos, 2, 3) << 12)
     );
@@ -1033,11 +1080,12 @@ static void frag_sbfx(
     uint8_t width
 )
 {
-    frag_instr16(
+    assert(width > 0);
+    frag_instr32(
         0xf3400000
         | (rd << 8)
         | (rn << 16)
-        | (width & 0b11111)
+        | ((width-1) & 0b11111)
         | (bits(pos, 0, 2) << 6)
         | (bits(pos, 2, 3) << 12)
     );
@@ -1105,7 +1153,7 @@ static void frag_add_rd_rn(
 {
     frag_instr16(
         THUMB16_ADD_REG_T2
-        | (rm << 4)
+        | (rm << 3)
         | (bits(rdn, 0, 3))
         | (bit(rdn, 3) << 7)
     );
@@ -1258,7 +1306,7 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
     }
     
     // pop {...}
-    frag_armpop((REGS_ALL & ~0xF) | (dis.use_lr << 14));
+    frag_armpop((REGS_ALL & ~0xF) | (/*dis.use_lr*/1 << 14));
     
     frag_ld_imm16(0, cycles);
     
@@ -1596,7 +1644,7 @@ static void frag_store_rz_reg8(int dstidx, sm83_oparg_t src)
     const uint8_t rn = reg_armidx(src);
     const uint8_t rd = dstidx;
     
-    if (src == REG_A)
+    if (src == OPARG_A)
     {
         frag_instr16_rd0_rm3(
             THUMB16_MOV_REG, dstidx, REG_A
@@ -1611,15 +1659,7 @@ static void frag_store_rz_reg8(int dstidx, sm83_oparg_t src)
     }
     else
     {
-        // movs r%dst, r%src
-        frag_instr16_rd0_rm3(THUMB16_MOV_REG, rd, rn);
-        
-        // uxtb r%dst, r%dst
-        frag_instr16(
-            0xB2C0
-            | (rd << 3)
-            | (rd << 0)
-        );
+        frag_bfi(rd, rn, 0, 8);
     }
 }
 
@@ -1645,36 +1685,11 @@ static void frag_store_reg8_rz(int srcidx, sm83_oparg_t dst)
     }
     else if (is_reglo(dst))
     {
-        // and r%dst, r%dst, #0xff00
-        frag_instr32(
-            0xf400407f
-            | (rd << 8)
-            | (rn << 16)
-        );
-        
-        // orr r%dst, r%src
-        frag_instr16(
-            0x4300
-            | (rd << 0)
-            | (rn << 3)
-        );
+        frag_bfi(rd, rn, 0, 8);
     }
     else if (is_reghi(dst))
     {
-        // uxtb r%dst,r%dst
-        frag_instr16(
-            0xb2c0
-            | (rd << 0)
-            | (rd << 3)
-        );
-        
-         // orr r%dst, r%dst, r%src, lsl #8
-        frag_instr32(
-            0xEA402000
-            | (rd << 16)
-            | (rd << 8)
-            | (rn << 0)
-        );
+        frag_bfi(rd, rn, 8, 8);
     }
     else
     {
@@ -1683,8 +1698,12 @@ static void frag_store_reg8_rz(int srcidx, sm83_oparg_t dst)
 }
 
 // dst <- r%sp + <signed 8-byte immediate>
+// used in:
+//   ld hl, sp+<signed i8>
+//   add sp, <signed i8>
 static void frag_spi8(sm83_oparg_t dst)
 {
+    // FIXME: double check flags here.
     dis.cycles += 1;
     if (dst == OPARG_SP) dis.cycles += 1;
     
@@ -1694,19 +1713,22 @@ static void frag_spi8(sm83_oparg_t dst)
     
     #if SETFLAGS
     // r%c <- r%sp & 0xff
-    frag_uxth(REG_Carry, REG_SP);
+    frag_uxtb(REG_Carry, REG_SP);
     
     // nh[3] <- r%sp << 24
     frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_NH, REG_Carry, 24);
     
     // r%c += immediate
-    frag_add_imm16(REG_Carry, REG_Carry, immediate);
+    frag_add_imm16(REG_Carry, REG_Carry, immediate & 0xff);
     
     // nh[2] <- immediate
     frag_imm12c_rd8_rn16(
         THUMB32_ORR_IMM,
         REG_NH, REG_NH, false, (uint8_t)immediate, 16
     );
+    
+    // r%c >>= 8
+    frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_Carry, REG_Carry, 8);
     #endif
     
     frag_add_imm16(reg_armidx(dst), REG_SP, immediate);
@@ -1715,11 +1737,19 @@ static void frag_spi8(sm83_oparg_t dst)
     // z <- 0
     frag_ld_imm16(REG_nZ, 1);
     #endif
+    
+    frag_uxth(reg_armidx(dst), reg_armidx(dst));
 }
 
 static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
 {
-    if (dst == OPARG_HLmi)
+    if (src == OPARG_B && dst == OPARG_B && opts.ld_b_b)
+    {
+        frag_delegate(opts.ld_b_b);
+        dis.done = 1;
+        return;
+    }
+    else if (dst == OPARG_HLmi)
     {
         frag_ld(OPARG_HLm, src);
         frag_inc(OPARG_HL);
@@ -2035,11 +2065,11 @@ typedef enum
 {
     SHIFT_LEFT,
     ROT_LEFT,
-    ROT_LEFT_CARRY,
+    ROT_LEFT_CIRCULAR,
     SHIFT_RIGHT,
     SHIFT_RIGHT_L,
     ROT_RIGHT,
-    ROT_RIGHT_CARRY,
+    ROT_RIGHT_CIRCULAR,
 } rotate_type;
 
 static void frag_rotate_helper(rotate_type rt, uint8_t regdst, uint8_t reg, uint8_t carry_in, uint8_t carry_out, bool setz)
@@ -2047,41 +2077,54 @@ static void frag_rotate_helper(rotate_type rt, uint8_t regdst, uint8_t reg, uint
     const uint8_t scratchreg = (reg == 0) ? 1 : 0;
     switch (rt)
     {
-    case ROT_LEFT:
     case SHIFT_LEFT:
-    case ROT_LEFT_CARRY:
         frag_instr16_rd0_rm3_imm5(
             THUMB16_LSL_IMM, reg, reg, 1
         );
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, regdst, reg
+        );
+        break;
+    case ROT_LEFT:
+        frag_bfi(reg, regdst, 1, 7);
         
-        if (rt == ROT_LEFT_CARRY)
+        // orr r%reg, r%carry_in
+        if (regdst == 0 && reg != regdst)
         {
+            // the other branch would work too
+            // it's just a guess that this might be faster?
             frag_instr16_rd0_rm3(
                 THUMB16_ORR_REG, reg, carry_in
             );
         }
-        else if (rt == ROT_LEFT)
+        else
         {
-            frag_rd8_rn16_rm0_shift(
-                THUMB32_ORR_REG, reg, reg, reg, IMM_SHIFT_LSR, 8
-            );
+            frag_bfi(regdst, carry_in, 0, 1);
         }
+
+        break;
+    case ROT_LEFT_CIRCULAR:
+    
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSL_IMM, reg, reg, 1
+        );
         
-        frag_instr16_rd0_rm3(
-            THUMB16_UXTB, regdst, reg
+        // reg |= reg >> 8
+        frag_rd8_rn16_rm0_shift(
+            THUMB32_ORR_REG, reg, reg, reg, IMM_SHIFT_LSR, 8
         );
         break;
     
     case SHIFT_RIGHT:
     case ROT_RIGHT:
-    case ROT_RIGHT_CARRY:
-        if (rt == ROT_RIGHT)
+    case ROT_RIGHT_CIRCULAR:
+        if (rt == ROT_RIGHT_CIRCULAR)
         {
             frag_rd8_rn16_rm0_shift(
                 THUMB32_ORR_REG, reg, reg, reg, IMM_SHIFT_LSL, 8
             );
         }
-        else if (rt == ROT_RIGHT_CARRY)
+        else if (rt == ROT_RIGHT)
         {
             frag_rd8_rn16_rm0_shift(
                 THUMB32_ORR_REG, reg, reg, carry_in, IMM_SHIFT_LSL, 8
@@ -2092,7 +2135,7 @@ static void frag_rotate_helper(rotate_type rt, uint8_t regdst, uint8_t reg, uint
         break;
         
     case SHIFT_RIGHT_L:
-        frag_sbfx(reg, reg, 1, 8);
+        frag_sbfx(reg, reg, 1, 7);
         frag_instr16_rd0_rm3(
             THUMB16_UXTB, regdst, reg
         );
@@ -2116,6 +2159,7 @@ static void frag_rotate_helper(rotate_type rt, uint8_t regdst, uint8_t reg, uint
 
 static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
 {
+    // TODO: rotate can be vastly improved with the bfi instruction
     assert(is_reg8(dst) || dst == OPARG_HLm);
     
     dis.cycles += reg_cycles(dst) * 2;
@@ -2135,8 +2179,8 @@ static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
     
     // transfer previous carry flag to nh;
     // this will effectively clear nh, and will allow us to briefly
-    // rely on REG_NH containing the carry bit,
-    // which some rotations need to read.
+    // rely on REG_NH containing the carry (in) bit,
+    // which some rotations need to read (RL, RR).
     // we can then freely set the carry (out) in advance of the operation.
     carry_in = REG_NH;
     
@@ -2149,14 +2193,14 @@ static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
     {
     case SHIFT_LEFT:
     case ROT_LEFT:
-    case ROT_LEFT_CARRY:
+    case ROT_LEFT_CIRCULAR:
         frag_ubfx(REG_Carry, reg, 7+bit_offset, 1);
         break;
         
     case SHIFT_RIGHT:
     case SHIFT_RIGHT_L:
     case ROT_RIGHT:
-    case ROT_RIGHT_CARRY:
+    case ROT_RIGHT_CIRCULAR:
         frag_ubfx(REG_Carry, reg, 0+bit_offset, 1);
         break;
     }
@@ -2164,33 +2208,117 @@ static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
     
     if (dst == OPARG_A)
     {
-        frag_rotate_helper(rt, OPARG_A, OPARG_A, carry_in, carry_out, setz);
+        frag_rotate_helper(rt, REG_A, REG_A, carry_in, carry_out, setz);
     }
     else if (is_reglo(dst))
     {
-        frag_instr16_rd0_rm3(
-            THUMB16_UXTB, 0, reg
-        );
-        frag_imm12c_rd8_rn16(
-            THUMB32_AND_IMM, reg, reg, false, 0xff, 24
-        );
-        frag_rotate_helper(rt, 0, 0, carry_in, carry_out, setz);
-        frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, reg, 0
-        );
+        assert(setz);
+        uint8_t scratch = 0;
+        #if SETFLAGS
+        scratch = REG_nZ;
+        #endif
+        
+        switch(rt)
+        {
+        case SHIFT_LEFT:
+            frag_bfi(reg, reg, 1, 7);
+            frag_imm12c_rd8_rn16(THUMB32_BIC_IMM, reg, reg, false, 1, 0);
+            #if SETFLAGS
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, REG_nZ, reg
+            );
+            #endif
+            break;
+        
+        case ROT_LEFT:
+        case ROT_LEFT_CIRCULAR:
+            #if SETFLAGS
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, REG_nZ, reg
+            );
+            #endif
+            frag_bfi(reg, reg, 1, 7);
+            frag_bfi(reg, (rt == ROT_LEFT_CIRCULAR) ? carry_out : carry_in, 0, 1);
+            break;
+            
+        case SHIFT_RIGHT:
+            frag_ubfx(scratch, reg, 1, 7);
+            frag_bfi(reg, scratch, 0, 8);
+            break;
+        
+        case SHIFT_RIGHT_L:
+            frag_sbfx(scratch, reg, 1, 7);
+            frag_bfi(reg, scratch, 0, 8);
+            break;
+            
+        case ROT_RIGHT:
+        case ROT_RIGHT_CIRCULAR:
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LSR_IMM, scratch, reg, 1
+            );
+            
+            frag_bfi(scratch, (rt == ROT_RIGHT_CIRCULAR) ? carry_out : carry_in, 7, 1);
+            frag_bfi(reg, scratch, 0, 8);
+            break;
+        }
     }
     else if (is_reghi(dst))
     {
-        frag_instr16_rd0_rm3_imm5(
-            THUMB16_LSR_IMM, 0, reg, 8
-        );
-        frag_instr16_rd0_rm3(
-            THUMB16_UXTB, reg, reg
-        );
-        frag_rotate_helper(rt, 0, 0, carry_in, carry_out, setz);
-        frag_rd8_rn16_rm0_shift(
-            THUMB32_ORR_REG, reg, reg, 0, IMM_SHIFT_LSL, 8
-        );
+        uint8_t scratch = 0;
+        #if SETFLAGS
+        scratch = REG_nZ;
+        #endif
+        assert(setz);
+        switch (rt)
+        {
+        case SHIFT_LEFT:
+            frag_ubfx(scratch, reg_armidx(dst), 8, 7);
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, reg_armidx(dst), reg_armidx(dst)
+            );
+            frag_bfi(reg_armidx(dst), scratch, 9, 7);
+            break;
+        case ROT_LEFT:
+        case ROT_LEFT_CIRCULAR:
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LSR_IMM, scratch, reg_armidx(dst), 7
+            );
+            frag_instr16_rd0_rm3(
+                THUMB16_ORR_REG, scratch, (rt == ROT_LEFT_CIRCULAR) ? carry_out : carry_in
+            );
+            
+            #if SETFLAGS
+            frag_instr16_rd0_rm3(
+                THUMB16_UXTB, scratch, scratch
+            );
+            #endif
+            
+            frag_bfi(reg_armidx(dst), scratch, 8, 8);
+            break;
+        case ROT_RIGHT_CIRCULAR:
+        case ROT_RIGHT:
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LSR_IMM, scratch, reg_armidx(dst), 9
+            );
+            frag_rd8_rn16_rm0_shift(
+                THUMB32_ORR_REG, scratch, scratch, (rt == ROT_RIGHT_CIRCULAR) ? carry_out : carry_in, IMM_SHIFT_LSL, 7
+            );
+            frag_bfi(reg_armidx(dst), scratch, 8, 8);
+            break;
+        case SHIFT_RIGHT:
+            frag_instr16_rd0_rm3_imm5(
+                THUMB16_LSR_IMM, scratch, reg_armidx(dst), 9
+            );
+            frag_bfi(reg_armidx(dst), scratch, 8, 8);
+            break;
+        case SHIFT_RIGHT_L:
+            frag_sbfx(scratch, reg_armidx(dst), 9, 7);
+            frag_bfi(reg_armidx(dst), scratch, 8, 8);
+            break;
+        default:
+            assert(false);
+            break;
+        }
     }
     else if (dst == OPARG_HLm)
     {
@@ -2205,60 +2333,44 @@ static void frag_rotate(rotate_type rt, sm83_oparg_t dst,  bool setz)
 
 static void frag_swap(sm83_oparg_t dst)
 {
+    // note: we could speed this up if we interlace the
+    // nhc flag clearing into the main swap section;
+    // this would 
     assert(is_reg8(dst) || dst == OPARG_HLm);
     
     if (dst == OPARG_A)
     {
-        frag_instr16_rd0_rm3_imm5(
-            THUMB16_LSR_IMM, 0, REG_A, 4
-        );
-        
-        frag_instr16_rd0_rm3_imm5(
-            THUMB16_LSL_IMM, REG_A, REG_A, 4
-        );
-        
-        frag_instr16_rd0_rm3(
-            THUMB16_UXTB, REG_A, REG_A
-        );
-        
-        frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, REG_A, 0
-        );
-        
         #if SETFLAGS
         // f: z=*
         frag_instr16_rd0_rm3(
             THUMB16_MOV_REG, REG_nZ, REG_A
         );
         #endif
+        frag_bfi(REG_A, REG_A, 8, 4);
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_LSR_IMM, REG_A, REG_A, 4
+        );
     }
     else if (is_reglo(dst))
     {
-        // TODO: optimize
-        frag_ubfx(0, reg_armidx(dst), 4, 4);
+        uint8_t altreg = 0;
+        #if SETFLAGS
+        altreg = REG_nZ;
+        #endif
         
         frag_instr16_rd0_rm3_imm5(
-            THUMB16_LSL_IMM, REG_nZ, reg_armidx(dst), 4
+            THUMB16_LSR_IMM, altreg, reg_armidx(dst), 4
         );
         
-        frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, REG_nZ, 0
-        );
+        frag_bfi(altreg, reg_armidx(dst), 4, 4);
+        frag_bfi(reg_armidx(dst), altreg, 0, 8);
         
-        // zero-out low byte
-        frag_imm12c_rd8_rn16(
-            THUMB32_AND_IMM, reg_armidx(dst), reg_armidx(dst), false, 0xff, 24
-        );
-        
+        #if SETFLAGS
+        // z=*
         frag_instr16_rd0_rm3(
             THUMB16_UXTB, REG_nZ, REG_nZ
         );
-        
-        frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, reg_armidx(dst), REG_nZ
-        );
-        
-        // z=* (already done, for free)
+        #endif
     }
     else if (is_reghi(dst))
     {
@@ -2287,6 +2399,8 @@ static void frag_swap(sm83_oparg_t dst)
         frag_instr16_rd0_rm3(
             THUMB16_ORR_REG, reg_armidx(dst), REG_nZ
         );
+        
+        // (we get z=* for free)
     }
     else if (dst == OPARG_HLm)
     {
@@ -2294,27 +2408,15 @@ static void frag_swap(sm83_oparg_t dst)
         
         // r0 now contains (HL)
         
+        frag_bfi(0, 0, 8, 4);
         frag_instr16_rd0_rm3_imm5(
             THUMB16_LSR_IMM, 1, 0, 4
-        );
-        
-        frag_instr16_rd0_rm3_imm5(
-            THUMB16_LSL_IMM, 0, 0, 4
-        );
-        
-        // OPT: this can be skipped if .write() takes uint32_t
-        frag_instr16_rd0_rm3(
-            THUMB16_UXTB, 0, 0
-        );
-        
-        frag_instr16_rd0_rm3(
-            THUMB16_ORR_REG, 1, 0
         );
         
         #if SETFLAGS
         // f: z=*
         frag_instr16_rd0_rm3(
-            THUMB16_MOV_REG, REG_nZ, 1
+            THUMB16_MOV_REG, REG_nZ, 0
         );
         #endif
         
@@ -2403,6 +2505,10 @@ static void frag_jump(sm83_oparg_t condition, sm83_oparg_t addrmode)
     else if (addrmode == ADDR_d16)
     {
         immediate = sm83_next_word();
+    }
+    else
+    {
+        assert(addrmode == ADDR_HL);
     }
     
     uint8_t condcycles = 0;
@@ -2555,7 +2661,7 @@ static void frag_ccf(void)
     #if SETFLAGS
     frag_imm12c_rd8_rn16(
         THUMB32_EOR_IMM,
-        REG_Carry, REG_Carry, 0, 1, 0
+        REG_Carry, REG_Carry, false, 1, 0
     );
     frag_set_nh(0, 0);
     #endif
@@ -2595,7 +2701,6 @@ static void frag_bitwise(sm83_oparg_t src, arithop_t arithop)
         op32imm = THUMB32_EOR_IMM;
     }
     
-    const uint8_t reg = reg_armidx(src);
     if (src == OPARG_A)
     {
     src_a:
@@ -2661,7 +2766,7 @@ static void frag_bitwise(sm83_oparg_t src, arithop_t arithop)
     else if (is_reglo(src))
     {
         frag_instr16_rd0_rm3(
-            op16, REG_A, reg
+            op16, REG_A, reg_armidx(src)
         );
         
         #if SETFLAGS
@@ -2680,7 +2785,7 @@ static void frag_bitwise(sm83_oparg_t src, arithop_t arithop)
     else if (is_reghi(src))
     {
         frag_rd8_rn16_rm0_shift(
-            op32, REG_A, REG_A, reg, IMM_SHIFT_LSR, 8
+            op32, REG_A, REG_A, reg_armidx(src), IMM_SHIFT_LSR, 8
         );
         
         #if SETFLAGS
@@ -2851,7 +2956,7 @@ static void frag_arithmetic(sm83_oparg_t dst, sm83_oparg_t src, arithop_t aritho
                     #if SETFLAGS
                     frag_ld_imm16(REG_nZ, 1); // z <- 0
                     frag_ld_imm16(REG_Carry, 0);
-                    frag_set_nh(1, 0);
+                    //frag_set_nh(1, 0); // (already done above)
                     #endif
                     break;
                     
@@ -3245,7 +3350,7 @@ static void frag_pop(sm83_oparg_t dst)
         // mov r0, r%sp
         frag_mov_rd_rm(0, REG_SP);
         
-        frag_bl((fn_type)opts.read);
+        frag_bl((fn_type)opts.readword);
         
         // adds r%sp, 2 [T2]
         frag_add_imm16(REG_SP, REG_SP, 2);
@@ -4144,7 +4249,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_B, OPARG_i8);
             
         case 0x07:
-            return frag_rotate(ROT_LEFT_CARRY, OPARG_A, false);
+            return frag_rotate(ROT_LEFT_CIRCULAR, OPARG_A, false);
             
         case 0x08:
             return frag_ld(OPARG_i16m, OPARG_SP);
@@ -4168,7 +4273,7 @@ static void disassemble_instruction(void)
             return frag_ld(OPARG_C, OPARG_i8);
             
         case 0x0F:
-            return frag_rotate(ROT_RIGHT_CARRY, OPARG_A, false);
+            return frag_rotate(ROT_RIGHT_CIRCULAR, OPARG_A, false);
         
         case 0x10: // STOP
             dis.done = 1;
@@ -4372,10 +4477,10 @@ static void disassemble_instruction(void)
             return frag_pop(OPARG_BC);
             
         case 0xC2:
-            return frag_jump(COND_nz, OPARG_i16);
+            return frag_jump(COND_nz, ADDR_d16);
             
         case 0xC3:
-            return frag_jump(COND_none, OPARG_i16);
+            return frag_jump(COND_none, ADDR_d16);
             
         case 0xC4:
             return frag_call(COND_nz);
@@ -4396,7 +4501,7 @@ static void disassemble_instruction(void)
             return frag_ret(COND_none);
             
         case 0xCA:
-            return frag_jump(COND_z, OPARG_i16);
+            return frag_jump(COND_z, ADDR_d16);
             
         case 0xCB:
             {
@@ -4405,9 +4510,9 @@ static void disassemble_instruction(void)
                 switch(opx/8)
                 {
                 case 0x00/8:
-                    return frag_rotate(ROT_LEFT_CARRY, arg, true);
+                    return frag_rotate(ROT_LEFT_CIRCULAR, arg, true);
                 case 0x08/8:
-                    return frag_rotate(ROT_RIGHT_CARRY, arg, true);
+                    return frag_rotate(ROT_RIGHT_CIRCULAR, arg, true);
                 case 0x10/8:
                     return frag_rotate(ROT_LEFT, arg, true);
                 case 0x18/8:
@@ -4448,7 +4553,7 @@ static void disassemble_instruction(void)
             return frag_pop(OPARG_DE);
             
         case 0xD2:
-            return frag_jump(COND_nc, OPARG_i16);
+            return frag_jump(COND_nc, ADDR_d16);
             
         case 0xD4:
             return frag_call(COND_nc);
@@ -4469,7 +4574,7 @@ static void disassemble_instruction(void)
             return frag_reti();
             
         case 0xDA:
-            return frag_jump(COND_c, OPARG_i16);
+            return frag_jump(COND_c, ADDR_d16);
             
         case 0xDC:
             return frag_call(COND_c);
@@ -4574,7 +4679,7 @@ static void prologue(void)
     
     // we have to push r4-r12 if we use them -- they are callee-push registers.
     uint16_t reg_push = (REGS_ALL & ~0xf);
-    if (dis.use_lr)
+    if (true) //(dis.use_lr)
     {
         reg_push |= (1 << 14);
     }
@@ -4586,6 +4691,7 @@ static void prologue(void)
     // push { r0 }
     frag_armpush(1 << 0);
     
+    JIT_DEBUG_MESSAGE("padding %d %d", dis.fragc, JIT_START_PADDING_ENTRY_C);
     assert(dis.fragc <= JIT_START_PADDING_ENTRY_C);
     dis.fragc = fragc;
 }
@@ -4606,7 +4712,6 @@ static void* disassemble_end(void)
     prologue();
     
     // accumulate size of output
-    
     size_t outsize = 0;
     for (size_t i = 0; i < dis.fragc; ++i)
     {
@@ -4626,7 +4731,7 @@ static void* disassemble_end(void)
         return NULL;
     }
     
-    JIT_DEBUG_MESSAGE("base address: %8x", out);
+    JIT_DEBUG_MESSAGE("base address: %8p", out);
     uint16_t* outb = out;
     
     for (size_t i = 0; i < dis.fragc; ++i)
@@ -4635,7 +4740,8 @@ static void* disassemble_end(void)
     }
     
     #ifdef JIT_DEBUG
-    #define printf opts.playdate->system->logToConsole
+    #ifndef TARGET_QEMU
+    #endif
     //JIT_DEBUG_MESSAGE("arm code: ");
     const char* outmsg;
     size_t fragi = 0;
@@ -4653,22 +4759,22 @@ static void* disassemble_end(void)
             if (dis.frag[fragi].romsrc)
             {
                 sm38d(dis.frag[fragi].romsrc, &outmsg);
-                printf("\n; %s", outmsg);
+                JIT_DEBUG_MESSAGE("\n; %s", outmsg);
             }
         }
         const uint16_t* armprev = arm;
         arm = armd(arm, &outmsg);
         if (arm && arm == armprev+1)
         {
-            printf("%04x ; %s", *armprev, outmsg);
+            JIT_DEBUG_MESSAGE("%04x ; %s", *armprev, outmsg);
         }
         else if (arm && arm == armprev+2)
         {
-            printf("%04x%04x ; %s", armprev[0], armprev[1], outmsg);
+            JIT_DEBUG_MESSAGE("%04x%04x ; %s", armprev[0], armprev[1], outmsg);
         }
         else
         {
-            opts.playdate->system->logToConsole("DISASM ERROR");
+            JIT_DEBUG_MESSAGE("DISASM ERROR");
         }
     }
     JIT_DEBUG_MESSAGE(" Done.\n");
@@ -4719,11 +4825,17 @@ static jit_fn jit_compile(uint16_t gb_addr, uint16_t gb_bank)
 
 void jit_invalidate_cache()
 {
-    #if TARGET_PLADATE
-    SCB_InvalidateDCache();
-    SCB_InvalidateICache();
-    SCB_InvalidateDCache();
-    SCB_InvalidateICache();
+    REPEAT_256_TIMES(
+        __asm volatile("nop"); __asm volatile("nop"); __asm volatile("nop"); __asm volatile("nop"); __asm volatile("nop");
+    )
+    
+    #if 0
+    #ifdef TARGET_PLAYDATE
+    volatile unsigned long int* const ICIALLU = (unsigned long int*)(void*)0xE000EF50;
+    *ICIALLU = 0;
+    __asm volatile ("dsb");
+    __asm volatile ("isb");
+    #endif
     #endif
 }
 

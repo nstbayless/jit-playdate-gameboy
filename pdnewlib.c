@@ -1,6 +1,6 @@
+#ifdef TARGET_PLAYDATE
 #include "pd_api.h"
 
-#if TARGET_PLAYDATE
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>

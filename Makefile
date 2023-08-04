@@ -23,11 +23,13 @@ endif
 
 VPATH +=
 
+SRCC = main.c jit.c armd.c sm38d.c
+
 # List C source files here
-SRC += main.c jit.c armd.c sm38d.c pdnewlib.c
+SRC += $(SRCC) pdnewlib.c
 
 # List all user directories here
-UINCDIR += $(VPATH) ./STM32CubeF7/Drivers/CMSIS/Include ./STM32CubeF7/Drivers/CMSIS/Device/ST/STM32F7xx/Include
+UINCDIR += $(VPATH)
 
 # List all user C define here, like -D_DEBUG=1
 UDEFS += -DJIT_DEBUG
@@ -44,3 +46,6 @@ ULIBS +=
 CLANGFLAGS +=
 
 include $(SDK)/C_API/buildsupport/common.mk
+
+jt_arm: $(SRCC)
+	arm-none-eabi-gcc $(SRCC) shnewlib.c $(UDEFS) -mthumb -mcpu=cortex-m3 -march=armv7-m -T qemu.ld -Wl,-Map=output.map -DTARGET_QEMU -g  -o jt_arm

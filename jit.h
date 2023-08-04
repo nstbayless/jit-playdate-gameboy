@@ -1,6 +1,9 @@
 #pragma once
 
+#ifndef TARGET_QEMU
 #include "pd_api.h"
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -12,7 +15,6 @@ typedef struct jit_regfile_t
     uint32_t bc;
     uint32_t de;
     uint32_t hl;
-    uint32_t sp;
     
     // bit 0 is 1 iff carry is set
     uint32_t carry;
@@ -28,6 +30,7 @@ typedef struct jit_regfile_t
     // byte 3: operand a
     // h is implicit: it is 1 if (a&0xf+b&xf+c)&0x10
     uint32_t nh;
+    uint32_t sp;
 
     uint32_t pc;
     uint32_t ime;
@@ -101,6 +104,11 @@ static inline uint8_t jit_regfile_get_f(uint32_t carry, uint32_t z, uint32_t nh)
     return ((!z) << 7) | (carry << 4) | jit_regfile_geth(nh) << 5 | (jit_regfile_getn(nh) << 6);
 }
 
+static inline uint8_t jit_regfile_p_get_f(jit_regfile_t* regfile)
+{
+    return jit_regfile_get_f(regfile->carry, regfile->z, regfile->nh);
+}
+
 // can assign the result to the .nh field.
 static inline uint32_t jit_regfile_setnh(bool n, bool h)
 {
@@ -122,10 +130,13 @@ typedef struct
     void (*write)(uint16_t addr, uint8_t value);
     uint16_t (*readword)(uint16_t addr);
     void (*writeword)(uint16_t addr, uint16_t value);
+    void (*ld_b_b)(void); // if nullptr, does nothing; otherwise, this is a convenient breakpoint.
     jit_regfile_t* regs;
     unsigned fixed_bank : 1; // 1 if the bank the code is in is switchable. (if no mapper, this should be 0.)
     unsigned is_gb_color : 1;
+    #ifndef TARGET_QEMU
     PlaydateAPI* playdate;
+    #endif
 } jit_opts;
 
 void jit_init(jit_opts opts);
@@ -141,8 +152,14 @@ jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank);
 
 // FIXME -- swap out for NDEBUG
 #ifndef __NDEBUG_
-    #define jit_assert(_A) do {if (!(_A)) playdate->system->error("assertion failed: " #_A);} while (0)
-    #define jit_assert_pd(_A, _PD) do {if (!(_A)) (_PD)->system->error("assertion failed: " #_A);} while (0)
+    #ifdef TARGET_QEMU
+        #include <assert.h>
+        #define jit_assert(_A) assert(_A)
+        #define jit_assert_pd(_A, _PD) assert(_A)
+    #else
+        #define jit_assert(_A) do {if (!(_A)) playdate->system->error("assertion failed: " #_A);} while (0)
+        #define jit_assert_pd(_A, _PD) do {if (!(_A)) (_PD)->system->error("assertion failed: " #_A);} while (0)
+    #endif
 #else
     #define jit_assert(...) {}
     #define jit_assert_pd(...) {}
