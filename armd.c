@@ -645,7 +645,7 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             if (rn != 0xF)
             {
                 // A6-244 SUB (imm) 12-bit
-                return prop("SUB" TODO);
+                return decode_op32_s20_rd8_rn16_imm12_0_12_26("SUBW", arm, 0);
             }
             else
             {
@@ -797,13 +797,13 @@ static int decode_32(const uint32_t arm, uintptr_t base)
             switch (op1)
             {
                 case 0b0000:
-                    return prop("sxth %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                    return prop("SXTH %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
                 case 0b0001:
-                    return prop("uxth %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                    return prop("UXTH %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
                 case 0b0100:
-                    return prop("sxtb %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                    return prop("SXTB %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
                 case 0b0101:
-                    return prop("uxtb %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
+                    return prop("UXTB %s, %s, #%d", rname(rd), rname(rm), bits(arm, 4, 2)*8);
                 case 0b1000 ... 0b1011:
                     if (!bit(op2, 2))
                     {
@@ -1000,20 +1000,13 @@ static int decode_16_misc(const uint16_t arm, uintptr_t base)
     assert(arm >> 12 == 0xB);
     const uint16_t opcode = bits(arm, 5, 7);
     
-    if (BITMATCH(opcode, 0, 0, 0, 1, x, x, x))
+    if (BITMATCH(opcode, x, 0, x, 1, x, x, x))
     {
         // A6-52 Compare and Branch on Zero
-        return 0;
-    }
-    else if (BITMATCH(opcode, 0, 0, 1, 1, x, x, x))
-    {
-        // A6-52 Compare and Branch on Zero
-        return 0;
-    }
-    else if (BITMATCH(opcode, 1, 0, 0, 1, x, x, x))
-    {
-        // A6-52 Compare and Branch on Non-Zero
-        return 0;
+        int nz = bit(arm, 11);
+        unsigned imm = (bits(arm, 3, 5) << 1) | (bit(arm, 9) << 6);
+        unsigned rn = bits(arm, 0, 3);
+        return prop("CB%sZ %s, +0x%x", nz ? "N" : "", rname(rn), imm);
     }
     else if (BITMATCH(opcode, 0, 1, 0, x, x, x, x))
     {

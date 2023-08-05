@@ -1,5 +1,5 @@
 #ifndef TARGET_QEMU
-    #include "pd_api.h"
+    #include <pd_api.h>
     #include "pdnewlib.h"
     #define printf playdate->system->logToConsole
 #else
@@ -79,6 +79,8 @@ static uint8_t hram[0x7F];
 
 static jit_regfile_t regs;
 static unsigned halt;
+
+#include "tests/test_12.c"
 
 static const uint8_t gbrom_nop[] = {
     0x10,     // stop
@@ -246,7 +248,7 @@ static uint16_t test_read_word(uint16_t addr)
 
 static void test_write_word(uint16_t addr, uint16_t value)
 {
-    printf("write word: %04X->%04x", (unsigned int) value, (unsigned int)addr);
+    printf("write word: %04X->%04X\n", (unsigned int) value, (unsigned int)addr);
     test_write(addr, value & 0xff);
     test_write(addr+1, value >> 8);
 }
@@ -289,17 +291,25 @@ void do_test(const uint8_t* rom)
     #ifdef __arm__
     while (!halt)
     {
-        printf("Getting jit at %x.\n", regs.pc);
+        bool _print = true;
+        if (regs.pc == 0x80)
+        {
+            const char str[2] = {regs.a, 0x0};
+            printf("%s", str);
+            _print = false;
+        }
+        
+        if (_print) printf("Getting jit at %x.\n", regs.pc);
         spin();
         jit_fn fn = jit_get(regs.pc, 0);
-        printf("Done.\n");
+        if (_print) printf("Done.\n");
         spin();
         if (fn)
         {
-            printf("invoking %04x @0x%p.\n", regs.pc, (void*)fn);
+            if (_print) printf("invoking %04x @0x%p.\n", regs.pc, (void*)fn);
             spin();
             fn(&regs);
-            printf("Done.\n");
+            if (_print) printf("Done.\n");
             spin();
         }
         else
@@ -311,7 +321,7 @@ void do_test(const uint8_t* rom)
     #else
     (void)jit_get(regs.pc, 0);
     #endif
-    printf("Test complete.");
+    printf("Test complete.\n");
     spin();
     jit_cleanup();
 }
@@ -349,6 +359,8 @@ int eventHandler
     {
         playdate->system->setAutoLockDisabled(0);
 #endif
+
+        #if 0
         printf("Nop:\n");
         do_test(gbrom_nop);
         
@@ -445,6 +457,11 @@ int eventHandler
         jit_assert(regs.hl == 0x2121);
         jit_assert(regs.bc == 0x0000);
         #endif
+        #endif
+        
+        printf("test_basic:");
+        do_test(test_12_gb);
+        jit_assert(regs.a  == 0x0);
     }
     return 0;
 }

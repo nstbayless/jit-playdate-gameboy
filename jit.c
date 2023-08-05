@@ -90,6 +90,20 @@
     #include <assert.h>
 #endif
 
+#ifdef TARGET_QEMU
+    #include <stdio.h>
+    #ifdef assert
+        #undef assert
+    #endif
+    
+    #define assert(statement) \
+        if (statement) {} else { \
+            printf("ASSERTION FAILED %s:%d: " #statement "\n", __FILE__, __LINE__); \
+            exit(1);\
+        }
+    
+#endif
+
 #ifndef false
     #define false 0
 #endif
@@ -167,7 +181,8 @@
 #define THUMB16_UXTH    0xB280
 #define THUMB16_UXTB    0xB2C0
 #define THUMB16_STR     0x6000
-#define THUMB16_LDR     0x6800
+#define THUMB16_LDR     0x6800 /* actually this is LDR_IMM_T1 */
+#define THUMB16_LDR_IMM_T2     0x9800
 #define THUMB16_STRH    0x8000
 #define THUMB16_CBZ     0xB100
 #define THUMB16_CBNZ    0xB900
@@ -560,7 +575,7 @@ static uint8_t fasm_cmpbranch(void* argsv, uint16_t* outbuff)
     uintptr_t args = (uintptr_t)argsv;
     uint8_t label = bits(args, 0, 8);
     bool n = bit(args, 8);
-    uint16_t reg = bit(args, 8);
+    uint8_t reg = bits(args, 8, 8);
     
     assert(reg == (reg & 0b111));
     assert(label < JIT_MAX_LABELS);
@@ -581,7 +596,15 @@ static uint8_t fasm_backpatch(void* labelv, uint16_t* outbuff)
         uint8_t label = (uintptr_t)labelv;
         assert(label < JIT_MAX_LABELS);
         uint16_t* base = dis.labelmap[label];
-        size_t offset = outbuff - base;
+        assert(base != NULL);
+        size_t offset = (char*)outbuff - (char*)base;
+        
+        /*
+            FIXME: why must we subtract 4? Instruction size is 2..?
+        */
+        assert (offset >= 4);
+        offset -= 4;
+        
         assert((offset & 1) == 0);
         offset >>= 1;
         assert(offset < 0x20);
@@ -851,6 +874,18 @@ static void frag_instr16_rd0_rm3_imm5(
     );
 }
 
+static void frag_instr16_rd0_imm8(
+    uint16_t instruction,
+    uint8_t rd,
+    uint8_t imm8
+)
+{
+    assert( rd == (rd & 0x7) );
+    frag_instr16(
+        instruction | imm8 | (rd << 8)
+    );
+}
+
 static void frag_uxtb(
     uint8_t dst, uint8_t src
 )
@@ -1010,7 +1045,8 @@ static void frag_ld_imm32(int dstidx, uint32_t imm)
     );
 }
 
-static void frag_access_multiple(bool store, uint16_t regs, uint8_t ptrreg)
+// writeback: ptrreg is modified (equivalent to '!' in assembly)
+static void frag_access_multiple(bool store, uint16_t regs, uint8_t ptrreg, bool writeback)
 {
     const uint16_t op16 = (store)
         ? THUMB16_STM
@@ -1020,7 +1056,7 @@ static void frag_access_multiple(bool store, uint16_t regs, uint8_t ptrreg)
         ? THUMB32_STM
         : THUMB32_LDM;
     
-    if (regs == (regs & 0xff))
+    if (regs == (regs & 0xff) && writeback)
     {
         frag_instr16(
             op16 | regs | (ptrreg << 8)
@@ -1029,7 +1065,7 @@ static void frag_access_multiple(bool store, uint16_t regs, uint8_t ptrreg)
     else
     {
         frag_instr32(
-            op32 | regs | (ptrreg << 16)
+            op32 | regs | (ptrreg << 16) | (writeback << 14)
         );
     }
 }
@@ -1220,7 +1256,7 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
     
     // STM r%regf, { ... }
     frag_access_multiple(
-        true, stm_regs, 0
+        true, stm_regs, 0, false
     );
     
     if (dis.edi)
@@ -1239,7 +1275,6 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
     // store pc
     uint8_t reg_regfile = 0;
     uint8_t reg_pc = 1;
-    const uint8_t reg_sp_tmp = 5;
     if (pc >= 0)
     {
         assert(pc < 0x10000);
@@ -1251,6 +1286,7 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
     }
     else if (pc == -2)
     {
+        const uint8_t reg_sp_tmp = 5;
         reg_pc = 0;
         reg_regfile = 4;
         
@@ -1277,10 +1313,16 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
         
         frag_bl((fn_type)opts.readword);
         
-        // adds r%sp, 2 [T2]
-        frag_add_imm16(REG_SP, REG_SP, 2);
+        // sp += 2
+        frag_add_imm16(reg_sp_tmp, reg_sp_tmp, 2);
         
         // (no need to uxth because we strh.)
+        frag_instr16_rd0_rm3_imm5(
+            THUMB16_STRH,
+            reg_sp_tmp,
+            reg_regfile,
+            offsetof(jit_regfile_t, sp) >> 1
+        );
     }
     else
     {
@@ -1293,17 +1335,6 @@ static void frag_epilogue(int32_t pc, uint32_t cycles)
         reg_regfile,
         offsetof(jit_regfile_t, pc) >> 2
     );
-    
-    if (pc == -2)
-    {
-        // store sp & 0xffff
-        frag_instr16_rd0_rm3_imm5(
-            THUMB16_STRH,
-            reg_sp_tmp,
-            reg_regfile,
-            offsetof(jit_regfile_t, sp) >> 1
-        );
-    }
     
     // pop {...}
     frag_armpop((REGS_ALL & ~0xF) | (/*dis.use_lr*/1 << 14));
@@ -2461,11 +2492,11 @@ static void frag_push_pc(void)
     
     dis.cycles += 2;
     
+    frag_add_imm16(0, REG_SP, -2);
     frag_armpush(regs);
-    // subs r%sp, 2 [T2]
-    frag_add_imm16(REG_SP, REG_SP, -2);
+    frag_uxth(REG_SP, 0);
+    frag_uxth(0, 0);
     frag_ld_imm16(1, pc);
-    frag_uxth(REG_SP, REG_SP);
     frag_bl((fn_type)opts.writeword);
     frag_armpop(regs);
 }
@@ -2559,7 +2590,7 @@ static void frag_call(sm83_oparg_t condition)
     }
     
     frag_push_pc();
-    frag_epilogue(newpc, condcycles);
+    frag_epilogue(newpc, dis.cycles + condcycles);
     
     if (condition != COND_none)
     {
@@ -2605,6 +2636,8 @@ static void frag_ret(sm83_oparg_t condition)
     {
         dis.epilogue = true;
     }
+    
+     dis.done = true;
 }
 
 static void frag_reti(void)
@@ -3254,9 +3287,31 @@ static void frag_push(sm83_oparg_t src)
         frag_instr16_rd0_rm3(THUMB16_MOV_REG, 1, REG_nZ);
         frag_instr16_rd0_rm3(THUMB16_MOV_REG, 2, REG_NH);
         frag_bl((fn_type)jit_regfile_get_f);
-        frag_rd8_rn16_rm0_shift(
-            THUMB32_ORR_REG, 1, 0, REG_A, IMM_SHIFT_LSL, 8
-        );
+        
+        if ((1 << REG_A) & 0xF & REGS_NONFLEX)
+        {
+            // recover r1 <- A
+            const unsigned int depth_A = __builtin_popcount(REGS_NONFLEX & 0xF & ~((1 << REG_A) - 1)) - 1;
+            
+            // ldr r1, [sp, depth_A * 4]
+            frag_instr16_rd0_imm8(
+                THUMB16_LDR_IMM_T2,
+                1,
+                depth_A
+            );
+            
+            // ORR r1,r0,r1<<8
+            frag_rd8_rn16_rm0_shift(
+                THUMB32_ORR_REG, 1, 0, 1, IMM_SHIFT_LSL, 8
+            );
+        }
+        else
+        {
+            frag_rd8_rn16_rm0_shift(
+                THUMB32_ORR_REG, 1, 0, REG_A, IMM_SHIFT_LSL, 8
+            );
+        }
+        
         frag_mov_rd_rm(0, REG_SP);
         frag_bl((fn_type)opts.writeword);
         frag_armpop(regs);
@@ -3293,10 +3348,9 @@ static void frag_pop(sm83_oparg_t dst)
 {
     dis.cycles += 1;
     
-    const uint16_t regs = (REGS_NONFLEX & ~(1 << reg_armidx(dst))) & 0xf;
-    
     if (dst == OPARG_AF)
     {
+        const uint16_t regs = (REGS_NONFLEX & ~(1 << REG_A)) & 0xf;
         frag_armpush(regs);
         
         frag_mov_rd_rm(0, REG_SP);
@@ -3345,6 +3399,8 @@ static void frag_pop(sm83_oparg_t dst)
     }
     else if (is_reg16(dst))
     {
+        const uint16_t regs = (REGS_NONFLEX & ~(1 << reg_armidx(dst))) & 0xf;
+        
         frag_armpush(regs);
         
         // mov r0, r%sp
@@ -4686,7 +4742,7 @@ static void prologue(void)
     frag_armpush(reg_push);
     
     // [A6.7.40] LDM r0, { ... }
-    frag_access_multiple(false, REGS_SM83, 0);
+    frag_access_multiple(false, REGS_SM83, 0, false);
     
     // push { r0 }
     frag_armpush(1 << 0);
@@ -4823,22 +4879,6 @@ static jit_fn jit_compile(uint16_t gb_addr, uint16_t gb_bank)
     return (jit_fn)arm_interworking_thumb(fn);
 }
 
-void jit_invalidate_cache()
-{
-    REPEAT_256_TIMES(
-        __asm volatile("nop"); __asm volatile("nop"); __asm volatile("nop"); __asm volatile("nop"); __asm volatile("nop");
-    )
-    
-    #if 0
-    #ifdef TARGET_PLAYDATE
-    volatile unsigned long int* const ICIALLU = (unsigned long int*)(void*)0xE000EF50;
-    *ICIALLU = 0;
-    __asm volatile ("dsb");
-    __asm volatile ("isb");
-    #endif
-    #endif
-}
-
 jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank)
 {
     jit_fn f = get_jit_fn(gb_addr, gb_bank);
@@ -4847,7 +4887,11 @@ jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank)
     // no existing fn -- create one.
     jit_fn fn = jit_compile(gb_addr, gb_bank);
     if (!fn) return NULL;
-    jit_invalidate_cache();
+    
+    #ifndef TARGET_QEMU
+    opts.playdate->system->clearICache();
+    #endif
+    
     return fn;
 }
 

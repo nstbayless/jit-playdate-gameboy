@@ -3,6 +3,17 @@
 PORT=1248
 
 killall qemu-system-arm
+killall main
+
+function is_port_in_use() {
+    ss -tulwn | grep -q ":$1"
+}
+
+while is_port_in_use $PORT; do
+    PORT=$((PORT + 1))
+done
+
+echo "using port $PORT"
 
 function bg() {
     $@&
@@ -17,16 +28,18 @@ then
 fi
 
 set -e
+make jt_arm
+
 $DEBUG_E qemu-system-arm -cpu cortex-m3 -machine mps2-an385 -nographic -semihosting -monitor none -serial stdio $DEBUG -kernel ./jt_arm
 
 if [ ! -z "$DEBUG" ]
 then
     sleep 0.5
-    gdb-multiarch \
+    gdb-multiarch -q \
         -iex "file ./jt_arm" \
         -iex "target remote localhost:$PORT" \
         -iex "set arm force-mode thumb" \
         -iex "display/i \$pc" \
-        -iex "b main" \
+        -iex "tb main" \
         -iex "c"
 fi

@@ -139,7 +139,7 @@ void __attribute__((noreturn)) _exit(int code)
 {
     char buff[100];
     memset(buff, 0, sizeof(buff));
-    snprintf(buff, 99, "exit status %d", code);
+    snprintf(buff, 99, "exit status %d\n", code);
     __exit_with_msg(buff);
 }
 

@@ -47,5 +47,5 @@ CLANGFLAGS +=
 
 include $(SDK)/C_API/buildsupport/common.mk
 
-jt_arm: $(SRCC)
-	arm-none-eabi-gcc $(SRCC) shnewlib.c $(UDEFS) -mthumb -mcpu=cortex-m3 -march=armv7-m -T qemu.ld -Wl,-Map=output.map -DTARGET_QEMU -g  -o jt_arm
+jt_arm: $(SRCC) shnewlib.c
+	arm-none-eabi-gcc $(SRCC) shnewlib.c $(UDEFS) -mthumb -mcpu=cortex-m3 -march=armv7-m -T mps2an385.ld -Wl,-Map=output.map -DTARGET_QEMU -g  -o jt_arm
