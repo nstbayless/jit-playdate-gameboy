@@ -23,9 +23,10 @@ typedef struct jit_regfile_t
     // any nonzero value if unset
     uint32_t z;
     
-    // bit 0: garbage (could be 0 or 1)
+    // nh is stored lazily in an unusual format:
+    // bits 0-4, 6-7: garbage (could be 0 or 1)
     // bit 5: n
-    // byte 1: c (in addition to 0 and 1, can also be 0x10; if c is 0x10 and a and b are 0, then h is set.)
+    // byte 1: operand c (carry in; in addition to 0 and 1, can also be 0x10; if c is 0x10 and a and b are 0, then h is set.)
     // byte 2: operand b
     // byte 3: operand a
     // h is implicit: it is 1 if (a&0xf+b&xf+c)&0x10
@@ -153,9 +154,13 @@ jit_fn jit_get(uint16_t gb_addr, uint16_t gb_bank);
 // FIXME -- swap out for NDEBUG
 #ifndef __NDEBUG_
     #ifdef TARGET_QEMU
-        #include <assert.h>
-        #define jit_assert(_A) assert(_A)
-        #define jit_assert_pd(_A, _PD) assert(_A)
+        #include <stdlib.h>
+        #define jit_assert(statement) \
+        if (statement) {} else { \
+            printf("ASSERTION FAILED %s:%d: " #statement "\n", __FILE__, __LINE__); \
+            exit(1);\
+        }
+        #define jit_assert_pd(statement, PD) jit_assert(statement)
     #else
         #define jit_assert(_A) do {if (!(_A)) playdate->system->error("assertion failed: " #_A);} while (0)
         #define jit_assert_pd(_A, _PD) do {if (!(_A)) (_PD)->system->error("assertion failed: " #_A);} while (0)

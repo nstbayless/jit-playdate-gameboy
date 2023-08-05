@@ -149,7 +149,7 @@ int sm38d(const uint8_t* sm38, const char** outchar)
         return prop(1, "dec H");
     
     case 0x26:
-        return prop(2, "dec (HL), $%02x", *sm38);
+        return prop(2, "ld H, $%02x", *sm38);
         
     case 0x27:
         return prop(1, "daa");
@@ -194,7 +194,7 @@ int sm38d(const uint8_t* sm38, const char** outchar)
         return prop(1, "dec (HL)");
     
     case 0x36:
-        return prop(2, "ld HL, $%02x", *sm38);
+        return prop(2, "ld (HL), $%02x", *sm38);
         
     case 0x37:
         return prop(1, "scf");

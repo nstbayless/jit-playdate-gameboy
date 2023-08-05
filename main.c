@@ -81,6 +81,7 @@ static jit_regfile_t regs;
 static unsigned halt;
 
 #include "tests/test_12.c"
+#include "tests/test_1.c"
 
 static const uint8_t gbrom_nop[] = {
     0x10,     // stop
@@ -213,6 +214,7 @@ static void test_halt(void)
 
 static void test_illegal(void)
 {
+    halt = 1;
     printf("ILLEGAL\n");
 }
 
@@ -459,8 +461,14 @@ int eventHandler
         #endif
         #endif
         
+        #if 0
         printf("test_basic:");
         do_test(test_12_gb);
+        jit_assert(regs.a  == 0x0);
+        #endif
+        
+        printf("test_special:");
+        do_test(test_1_gb);
         jit_assert(regs.a  == 0x0);
     }
     return 0;

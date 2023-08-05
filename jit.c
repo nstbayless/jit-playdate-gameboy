@@ -412,6 +412,8 @@ static struct {
     // 1 if (main branch) epilogue inserted already.
     unsigned epilogue : 1;
     
+    size_t next_label;
+    
     // points to cbz/cbnz instructions, to backpatch labels into afterward.
     uint16_t* labelmap[JIT_MAX_LABELS];
 } dis;
@@ -575,7 +577,7 @@ static uint8_t fasm_cmpbranch(void* argsv, uint16_t* outbuff)
     uintptr_t args = (uintptr_t)argsv;
     uint8_t label = bits(args, 0, 8);
     bool n = bit(args, 8);
-    uint8_t reg = bits(args, 8, 8);
+    uint8_t reg = bits(args, 16, 8);
     
     assert(reg == (reg & 0b111));
     assert(label < JIT_MAX_LABELS);
@@ -632,7 +634,7 @@ static void frag_instr16(uint16_t instr)
 static void frag_cmpbranch(bool cbnz, uint8_t reg, uint8_t label)
 {
     assert(label < JIT_MAX_LABELS);
-    const uintptr_t arg = (label) | (reg << 16) | (cbnz << 8);
+    const uintptr_t arg = (label) | (((uintptr_t)reg) << 16) | ((uintptr_t)cbnz << 8);
     dis.frag[dis.fragc++] = FRAG(
         .args = (void*)(uintptr_t)arg,
         .produce = fasm_cmpbranch
@@ -1901,7 +1903,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         || dst == OPARG_BCm || dst == OPARG_DEm || dst == OPARG_HLm
     )
     {
-        assert(is_reg8(src));
+        assert(is_reg8(src) || src == OPARG_i8);
         // FIXME: frag_push/frag_pop should be its own instruction, because
         // if we clobber r1 and it's smear-written later... aaahh...
         // well, we always push r1 as a result, but that isn't *always* needed!
@@ -1935,8 +1937,14 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         
         // movs r1, value
         assert (REG_A == 1);
-        if (src != OPARG_A)
+        switch (src)
         {
+        case OPARG_A:
+            break; // nothing to be done.
+        case OPARG_i8:
+            frag_ld_imm16(1, immediate);
+            break;
+        default:
             // it's safe to clobber r1 with the write value
             // because we'll pop r1 -> a later if it is needed.
             frag_store_rz_reg8(1, src);
@@ -2545,7 +2553,7 @@ static void frag_jump(sm83_oparg_t condition, sm83_oparg_t addrmode)
     uint8_t condcycles = 0;
     if (condition != COND_none)
     {
-        frag_condjump(condition, false, 0);
+        frag_condjump(condition, false, dis.next_label);
         condcycles = 3;
     }
     else
@@ -2564,7 +2572,7 @@ static void frag_jump(sm83_oparg_t condition, sm83_oparg_t addrmode)
     
     if (condition != COND_none)
     {
-        frag_label(0);
+        frag_label(dis.next_label++);
     }
     else
     {
@@ -2581,7 +2589,7 @@ static void frag_call(sm83_oparg_t condition)
     uint8_t condcycles = 0;
     if (condition != COND_none)
     {
-        frag_condjump(condition, false, 0);
+        frag_condjump(condition, false, dis.next_label);
         condcycles = 3;
     }
     else
@@ -2594,7 +2602,7 @@ static void frag_call(sm83_oparg_t condition)
     
     if (condition != COND_none)
     {
-        frag_label(0);
+        frag_label(dis.next_label++);
     }
     else
     {
@@ -2618,7 +2626,7 @@ static void frag_ret(sm83_oparg_t condition)
     if (condition != COND_none)
     {
         dis.cycles += 1;
-        frag_condjump(condition, false, 0);
+        frag_condjump(condition, false, dis.next_label);
         condcycles = 3;
     }
     else
@@ -2630,7 +2638,7 @@ static void frag_ret(sm83_oparg_t condition)
     
     if (condition != COND_none)
     {
-        frag_label(0);
+        frag_label(dis.next_label++);
     }
     else
     {
@@ -2854,6 +2862,7 @@ static void frag_arithmetic(sm83_oparg_t dst, sm83_oparg_t src, arithop_t aritho
 {
     if (src == OPARG_i8 && dst == OPARG_SP && arithop == ADD)
     {
+        // special case: add sp,i8
         frag_spi8(dst);
         return;
     }
@@ -2870,7 +2879,7 @@ static void frag_arithmetic(sm83_oparg_t dst, sm83_oparg_t src, arithop_t aritho
     }
     
     #if SETFLAGS
-    if (dst != REG_HL || src != REG_HL)
+    if (dst != REG_HL || src != REG_HL) // (we set nh directly in the add hl,hl case later)
     {
         // note: h flag will be modified further later.
         frag_set_nh(subtract, 0);
@@ -2885,10 +2894,10 @@ static void frag_arithmetic(sm83_oparg_t dst, sm83_oparg_t src, arithop_t aritho
     
     if (dst == OPARG_A)
     {
-        if (src == OPARG_i8m)
+        if (src == OPARG_i8)
         {
             uint8_t immediate = sm83_next_byte();
-            // note: we can't replace with inc/dec if immediate is 1, because flags are different.
+            // note: we can't replace with inc/dec if immediate is 1; flags are different.
                 
             #if SETFLAGS
             // nh[3] <- REG_A
@@ -2897,7 +2906,7 @@ static void frag_arithmetic(sm83_oparg_t dst, sm83_oparg_t src, arithop_t aritho
             );
             #endif
             
-            frag_add_imm16(REG_A, REG_A,
+            frag_add_imm16(dstreg, REG_A,
                 (subtract) ? -(int32_t)immediate : (int32_t)immediate
             );
             
@@ -2910,8 +2919,8 @@ static void frag_arithmetic(sm83_oparg_t dst, sm83_oparg_t src, arithop_t aritho
                 );
                 #endif
                 
-                // r%a += c
-                frag_instr16_rd0_rn3_rm6(THUMB16_ADD_REG_T1, REG_A, REG_A, REG_Carry);
+                // r%dst += c
+                frag_instr16_rd0_rn3_rm6(THUMB16_ADD_REG_T1, dstreg, REG_A, REG_Carry);
             }
             
             #if SETFLAGS
@@ -3360,22 +3369,30 @@ static void frag_pop(sm83_oparg_t dst)
         // adds r%sp, 2 [T2]
         frag_add_imm16(REG_SP, REG_SP, 2);
         
-        // nh <- r0 << 6
-        frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_NH, 0, 6);
+        // nh <- r0 << 7
+        // (shifts 'h' to bit 12)
+        frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_NH, 0, 7);
         
         // a <- r0 >> 8
         frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_A, 0, 8);
         
-        // nh &= $100
+        // r0 <- r0 & 0xFF
+        frag_instr16_rd0_rm3(
+            THUMB16_UXTB, 0, 0
+        );
+        
+        // nh &= $1000
+        // (masks to just bit 12)
         frag_imm12c_rd8_rn16(
             THUMB32_AND_IMM,
-            REG_NH, 0, false, 1, 24
+            REG_NH, REG_NH, false, 1, 20
         );
         
         // c <- bit(r0, 4)
         frag_ubfx(REG_Carry, 0, 4, 1);
         
         // nh |= (r0 >> 1)
+        // (shifts 'n' into bit 5; also some garbage in the lower byte)
         frag_rd8_rn16_rm0_shift(
             THUMB32_ORR_REG, REG_NH, REG_NH, 0, IMM_SHIFT_LSR, 1
         );
@@ -3430,6 +3447,7 @@ static int disassemble_done(void)
     if (dis.error) return 1;
     if (dis.rom >= dis.romend - 2) return 1;
     if (dis.fragc >= 0x200) return 1;
+    if (dis.next_label >= JIT_MAX_LABELS-1) return 1;
     return dis.done;
 }
 
@@ -3710,13 +3728,13 @@ static void collect_dependencies(void)
             
         case 0x25:
             // dec H
-            IN(HL);
-            OUT(HL, Z, NH);
+            IN(H);
+            OUT(H, Z, NH);
             break;
             
         case 0x26:
-            // ld (HL), i8
-            IN(HL);
+            // ld H, i8
+            IN(H);
             break;
             
         case 0x27:
@@ -4260,7 +4278,7 @@ static void collect_dependencies(void)
             // ei
             break;
             
-        case 0xFD:
+        case 0xFE:
             // cp i8
             IN(A);
             OUT(Z, NH, C);
@@ -4399,7 +4417,7 @@ static void disassemble_instruction(void)
             return frag_dec(OPARG_H);
             
         case 0x26:
-            return frag_ld(OPARG_HLm, OPARG_i8);
+            return frag_ld(OPARG_H, OPARG_i8);
             
         case 0x27:
             return frag_daa();
@@ -4707,7 +4725,7 @@ static void disassemble_instruction(void)
         case 0xFB:
             return frag_edi(1);
             
-        case 0xFD:
+        case 0xFE:
             return frag_cp(OPARG_i8);
             
         case 0xFF:
