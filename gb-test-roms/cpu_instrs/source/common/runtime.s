@@ -26,6 +26,9 @@
 .define gb_id  bss
 .redefine bss  bss+1
 
+.define print_char_nocrc bss
+.redefine bss            bss+3
+
 ; Stack is normally here
 .define std_stack $DFFF
 

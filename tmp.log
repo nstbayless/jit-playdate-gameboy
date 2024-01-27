@@ -1,0 +1,482 @@
+update crc / checksum: ffffffff
+padding 3 10
+base address: 0x21029f80; gb addr: 0257
+e92d41f0 ; PUSH.W { r4, r5, r6, r7, r8, lr,  }
+e89001fe ; LDM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+b401 ; PUSH { r0,  }
+
+; push AF
+f2a80802 ; SUBW r8,r8,#$2
+b40e ; PUSH { r1, r2, r3,  }
+0028 ; MOV r0, r5
+fa1ff888 ; UXTH r8, r8, #0
+0031 ; MOV r1, r6
+003a ; MOV r2, r7
+f6401e47 ; MOVW lr,#$0947
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+9900 ; LDR r1, [SP,00]
+ea402101 ; ORR.W r1, r0, r1<<8
+4640 ; MOV r0, r8
+f2404e31 ; MOVW lr,#$0431
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+
+; push BC
+b40e ; PUSH { r1, r2, r3,  }
+f2a80802 ; SUBW r8,r8,#$2
+0011 ; MOV r1, r2
+fa1ff888 ; UXTH r8, r8, #0
+4640 ; MOV r0, r8
+f2404e31 ; MOVW lr,#$0431
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+
+; push DE
+b40e ; PUSH { r1, r2, r3,  }
+f2a80802 ; SUBW r8,r8,#$2
+0019 ; MOV r1, r3
+fa1ff888 ; UXTH r8, r8, #0
+4640 ; MOV r0, r8
+f2404e31 ; MOVW lr,#$0431
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+
+; push HL
+b40e ; PUSH { r1, r2, r3,  }
+f2a80802 ; SUBW r8,r8,#$2
+0021 ; MOV r1, r4
+fa1ff888 ; UXTH r8, r8, #0
+4640 ; MOV r0, r8
+f2404e31 ; MOVW lr,#$0431
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+
+; ld HL, $ff83
+f64f7483 ; MOVW r4,#$ff83
+
+; ld B, (HL)
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+f2403e25 ; MOVW lr,#$0325
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+f360220f ; BFI r2, r0, #8, #8
+
+; dec L
+0a20 ; LSR r0, r4, #8
+1e64 ; SUBS r4,r4,01
+0627 ; LSL r7, r4, #24
+b2e4 ; UXTB r4, r4
+f4477788 ; ORR r7,r7,#$110
+000e ; MOV r6, r1
+ea442400 ; ORR.W r4, r4, r0<<8
+
+; ld C, (HL)
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+f2403e25 ; MOVW lr,#$0325
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+f3600207 ; BFI r2, r0, #0, #8
+
+; dec L
+0a20 ; LSR r0, r4, #8
+1e64 ; SUBS r4,r4,01
+0627 ; LSL r7, r4, #24
+b2e4 ; UXTB r4, r4
+f4477788 ; ORR r7,r7,#$110
+000e ; MOV r6, r1
+ea442400 ; ORR.W r4, r4, r0<<8
+
+; ld D, (HL)
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+f2403e25 ; MOVW lr,#$0325
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+f360230f ; BFI r3, r0, #8, #8
+
+; dec L
+0a20 ; LSR r0, r4, #8
+1e64 ; SUBS r4,r4,01
+0627 ; LSL r7, r4, #24
+b2e4 ; UXTB r4, r4
+f4477788 ; ORR r7,r7,#$110
+000e ; MOV r6, r1
+ea442400 ; ORR.W r4, r4, r0<<8
+
+; xor (HL)
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+f2403e25 ; MOVW lr,#$0325
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+4041 ; EORS r1, r0
+2601 ; MOVS r6, #$01
+2700 ; MOVS r7, #$00
+2500 ; MOVS r5, #$00
+
+; ld H, $08
+b2e4 ; UXTB r4, r4
+f4446400 ; ORR r4,r4,#$800
+
+; SRL B
+002f ; MOV r7, r5
+f3c22500 ; UBFX r5, r2, #8, #1
+f3422646 ; SBFX r6, r2, #9, #7
+f366220f ; BFI r2, r6, #8, #8
+
+; ROR C
+002f ; MOV r7, r5
+f3c20500 ; UBFX r5, r2, #0, #1
+0856 ; LSR r6, r2, #1
+f36716c7 ; BFI r6, r7, #7, #1
+f3660207 ; BFI r2, r6, #0, #8
+
+; ROR D
+002f ; MOV r7, r5
+f3c32500 ; UBFX r5, r3, #8, #1
+0a5e ; LSR r6, r3, #9
+ea4616c7 ; ORR.W r6, r6, r7<<7
+f366230f ; BFI r3, r6, #8, #8
+
+; rra
+002f ; MOV r7, r5
+f3c10500 ; UBFX r5, r1, #0, #1
+ea412107 ; ORR.W r1, r1, r7<<8
+f3c10147 ; UBFX r1, r1, #1, #8
+2601 ; MOVS r6, #$01
+
+; jr nc,$10
+b955 ; CBNZ r5, +0x14
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402180 ; MOVW r1,#$0280
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+2020 ; MOVS r0, #$20
+4770 ; BX lr
+bf00 ; NOP
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402170 ; MOVW r1,#$0270
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+201d ; MOVS r0, #$1d
+4770 ; BX lr
+bf00 ; NOP
+ Done.
+
+padding 3 10
+base address: 0x2102a128; gb addr: 0270
+e92d41f0 ; PUSH.W { r4, r5, r6, r7, r8, lr,  }
+e89001fe ; LDM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+b401 ; PUSH { r0,  }
+
+; ld E, A
+f3610307 ; BFI r3, r1, #0, #8
+
+; ld A, B
+0a11 ; LSR r1, r2, #8
+
+; xor $ed
+f08101ed ; EOR r1,r1,#$ed
+000e ; MOV r6, r1
+2700 ; MOVS r7, #$00
+2500 ; MOVS r5, #$00
+
+; ld B, A
+f361220f ; BFI r2, r1, #8, #8
+
+; ld A, C
+f3620107 ; BFI r1, r2, #0, #8
+
+; xor $b8
+f08101b8 ; EOR r1,r1,#$b8
+000e ; MOV r6, r1
+2700 ; MOVS r7, #$00
+2500 ; MOVS r5, #$00
+
+; ld C, A
+f3610207 ; BFI r2, r1, #0, #8
+
+; ld A, D
+0a19 ; LSR r1, r3, #8
+
+; xor $83
+f0810183 ; EOR r1,r1,#$83
+000e ; MOV r6, r1
+2700 ; MOVS r7, #$00
+2500 ; MOVS r5, #$00
+
+; ld D, A
+f361230f ; BFI r3, r1, #8, #8
+
+; ld A, E
+f3630107 ; BFI r1, r3, #0, #8
+
+; xor $20
+f0810120 ; EOR r1,r1,#$20
+000e ; MOV r6, r1
+2700 ; MOVS r7, #$00
+2500 ; MOVS r5, #$00
+
+; dec H
+f2a41400 ; SUBW r4,r4,#$100
+0a27 ; LSR r7, r4, #8
+b2a4 ; UXTH r4, r4
+063f ; LSL r7, r7, #24
+0a26 ; LSR r6, r4, #8
+f4477788 ; ORR r7,r7,#$110
+
+; jr nz, $e4
+b156 ; CBZ r6, +0x14
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402167 ; MOVW r1,#$0267
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+2016 ; MOVS r0, #$16
+4770 ; BX lr
+bf00 ; NOP
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402183 ; MOVW r1,#$0283
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+2013 ; MOVS r0, #$13
+4770 ; BX lr
+bf00 ; NOP
+ Done.
+
+padding 3 10
+base address: 0x2102a1d0; gb addr: 0267
+e92d41f0 ; PUSH.W { r4, r5, r6, r7, r8, lr,  }
+e89001fe ; LDM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+b401 ; PUSH { r0,  }
+
+; SRL B
+002f ; MOV r7, r5
+f3c22500 ; UBFX r5, r2, #8, #1
+f3422646 ; SBFX r6, r2, #9, #7
+f366220f ; BFI r2, r6, #8, #8
+
+; ROR C
+002f ; MOV r7, r5
+f3c20500 ; UBFX r5, r2, #0, #1
+0856 ; LSR r6, r2, #1
+f36716c7 ; BFI r6, r7, #7, #1
+f3660207 ; BFI r2, r6, #0, #8
+
+; ROR D
+002f ; MOV r7, r5
+f3c32500 ; UBFX r5, r3, #8, #1
+0a5e ; LSR r6, r3, #9
+ea4616c7 ; ORR.W r6, r6, r7<<7
+f366230f ; BFI r3, r6, #8, #8
+
+; rra
+002f ; MOV r7, r5
+f3c10500 ; UBFX r5, r1, #0, #1
+ea412107 ; ORR.W r1, r1, r7<<8
+f3c10147 ; UBFX r1, r1, #1, #8
+2601 ; MOVS r6, #$01
+
+; jr nc,$10
+b955 ; CBNZ r5, +0x14
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402180 ; MOVW r1,#$0280
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+200c ; MOVS r0, #$0c
+4770 ; BX lr
+bf00 ; NOP
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402170 ; MOVW r1,#$0270
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+2009 ; MOVS r0, #$09
+4770 ; BX lr
+bf00 ; NOP
+ Done.
+
+padding 3 10
+base address: 0x2102a268; gb addr: 0280
+e92d41f0 ; PUSH.W { r4, r5, r6, r7, r8, lr,  }
+e89001fe ; LDM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+b401 ; PUSH { r0,  }
+
+; dec H
+f2a41400 ; SUBW r4,r4,#$100
+0a27 ; LSR r7, r4, #8
+b2a4 ; UXTH r4, r4
+063f ; LSL r7, r7, #24
+0a26 ; LSR r6, r4, #8
+f4477788 ; ORR r7,r7,#$110
+
+; jr nz, $e4
+b156 ; CBZ r6, +0x14
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402167 ; MOVW r1,#$0267
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+2006 ; MOVS r0, #$06
+4770 ; BX lr
+bf00 ; NOP
+bc01 ; POP { r0,  }
+e88001fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+f2402183 ; MOVW r1,#$0283
+6201 ; STR r1, [r0,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+2003 ; MOVS r0, #$03
+4770 ; BX lr
+bf00 ; NOP
+ Done.
+
+padding 3 10
+base address: 0x2102b3f0; gb addr: 0283
+e92d41f0 ; PUSH.W { r4, r5, r6, r7, r8, lr,  }
+e89001fe ; LDM.W r0 { r1, r2, r3, r4, r5, r6, r7, r8,  }
+b401 ; PUSH { r0,  }
+
+; ld H, $ff
+b2e4 ; UXTB r4, r4
+f444447f ; ORR r4,r4,#$ff00
+
+; ld (HL+), a
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+f2403e99 ; MOVW lr,#$0399
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+1c64 ; ADDS r4,r4,01
+b2a4 ; UXTH r4, r4
+
+; ld (HL), D
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+0a19 ; LSR r1, r3, #8
+f2403e99 ; MOVW lr,#$0399
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+
+; inc L
+0a20 ; LSR r0, r4, #8
+b2e7 ; UXTB r7, r4
+1c64 ; ADDS r4,r4,01
+043f ; LSL r7, r7, #16
+b2e4 ; UXTB r4, r4
+f4477780 ; ORR r7,r7,#$100
+000e ; MOV r6, r1
+ea442400 ; ORR.W r4, r4, r0<<8
+
+; ld (HL), C
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+f3620107 ; BFI r1, r2, #0, #8
+f2403e99 ; MOVW lr,#$0399
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+
+; inc L
+0a20 ; LSR r0, r4, #8
+b2e7 ; UXTB r7, r4
+1c64 ; ADDS r4,r4,01
+043f ; LSL r7, r7, #16
+b2e4 ; UXTB r4, r4
+f4477780 ; ORR r7,r7,#$100
+000e ; MOV r6, r1
+ea442400 ; ORR.W r4, r4, r0<<8
+
+; ld (HL), B
+b40e ; PUSH { r1, r2, r3,  }
+0020 ; MOV r0, r4
+0a11 ; LSR r1, r2, #8
+f2403e99 ; MOVW lr,#$0399
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+bc0e ; POP { r1, r2, r3,  }
+
+; pop HL
+b40e ; PUSH { r1, r2, r3,  }
+4640 ; MOV r0, r8
+f2403ef9 ; MOVW lr,#$03f9
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+f2080802 ; ADDW r8,r8,#$2
+bc0e ; POP { r1, r2, r3,  }
+fa1ff888 ; UXTH r8, r8, #0
+0004 ; MOV r4, r0
+
+; pop DE
+b406 ; PUSH { r1, r2,  }
+4640 ; MOV r0, r8
+f2403ef9 ; MOVW lr,#$03f9
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+f2080802 ; ADDW r8,r8,#$2
+bc06 ; POP { r1, r2,  }
+fa1ff888 ; UXTH r8, r8, #0
+0003 ; MOV r3, r0
+
+; pop BC
+b40a ; PUSH { r1, r3,  }
+4640 ; MOV r0, r8
+f2403ef9 ; MOVW lr,#$03f9
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+f2080802 ; ADDW r8,r8,#$2
+bc0a ; POP { r1, r3,  }
+fa1ff888 ; UXTH r8, r8, #0
+0002 ; MOV r2, r0
+
+; pop AF
+b40c ; PUSH { r2, r3,  }
+4640 ; MOV r0, r8
+f2403ef9 ; MOVW lr,#$03f9
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+01c7 ; LSL r7, r0, #7
+0a01 ; LSR r1, r0, #8
+f2080802 ; ADDW r8,r8,#$2
+b2c0 ; UXTB r0, r0
+f4075780 ; AND r7,r7,#$1000
+f3c01500 ; UBFX r5, r0, #4, #1
+ea470750 ; ORR.W r7, r7, r0>>>1
+f0000680 ; AND r6,r0,#$80
+fa1ff888 ; UXTH r8, r8, #0
+f0860680 ; EOR r6,r6,#$80
+bc0c ; POP { r2, r3,  }
+
+; ret
+bc01 ; POP { r0,  }
+e88000fe ; STM.W r0 { r1, r2, r3, r4, r5, r6, r7,  }
+0004 ; MOV r4, r0
+4640 ; MOV r0, r8
+0005 ; MOV r5, r0
+f2403ef9 ; MOVW lr,#$03f9
+f2c21e00 ; MOVT lr,#$2100
+47f0 ; BLX lr
+1cad ; ADDS r5,r5,02
+83a5 ; STRH r5, [r4,1c]
+6220 ; STR r0, [r4,20]
+e8bd41f0 ; POP { r4, r5, r6, r7, r8, lr,  }
+2018 ; MOVS r0, #$18
+4770 ; BX lr
+bf00 ; NOP
+ Done.

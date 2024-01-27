@@ -25,10 +25,6 @@ reset_crc:
 ; Preserved: AF, BC, DE, HL
 ; Time: 237 cycles average
 update_crc:
-     ; TMP HACK DONOTCOMMIT
-     push af
-     pop af
-     ret
 
      ; 65 cycles + 8*cycles per bit
      ; min cycles per bit: 14

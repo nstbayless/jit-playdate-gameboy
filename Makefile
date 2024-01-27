@@ -32,7 +32,7 @@ SRC += $(SRCC) pdnewlib.c
 UINCDIR += $(VPATH)
 
 # List all user C define here, like -D_DEBUG=1
-UDEFS += #-DJIT_DEBUG
+UDEFS += -DJIT_DEBUG
 
 # Define ASM defines here
 UADEFS +=

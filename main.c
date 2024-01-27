@@ -317,10 +317,6 @@ void do_test(const uint8_t* rom, cb_t cb)
         if (_print) spin();
         if (fn)
         {
-            if (regs.pc == 0x4C1)
-            {
-                printf("de %x\n", regs.de);
-            }
             if (_print) printf("invoking %04x @0x%p.\n", regs.pc, (void*)fn);
             if (_print) spin();
             fn(&regs);
@@ -388,11 +384,20 @@ void blargg_print_cb(jit_opts* opts)
     {
         //printf("0-hl: %x\n", regs.hl);
     }
-    if (regs.pc == 0x4B2)
+    if (regs.pc == 0x4a3)
     {
-        printf("de: %x\n", regs.de);
+        blargg_print_checksum();
     }
-    if (regs.pc == 0x4C7)
+    if (regs.pc == 0x257)
+    {
+        static int v = 0;
+        if (v++ < 0x20)
+        {
+            printf("update crc / ");
+            blargg_print_checksum();
+        }
+    }
+    if (regs.pc == 0x3f6)
     {
         blargg_print_checksum();
     }
@@ -525,7 +530,7 @@ int eventHandler
         do_print = false;
         do_test(test_1_gb, blargg_print_cb);
         do_print = true;
-        jit_assert(regs.a  == 0x0);
+        jit_assert(regs.a  == 0x0); // tests_passed sets to 0
         #endif
     }
     return 0;

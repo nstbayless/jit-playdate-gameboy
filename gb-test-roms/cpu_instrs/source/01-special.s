@@ -3,8 +3,6 @@
 .include "shell.inc"
 
 main:
-     print_str "ABXY",newline
-     jp tests_passed
      set_test 2,"JR negative"
      ld   a,0
      jp   jr_neg
@@ -52,8 +50,8 @@ jr_neg:
      inc  b
      inc  c
      jr   nz,-
-     
-     
+
+test_6:
      set_test 6,"DAA"
      ; Test all combinations of A and flags (256*16 total)
      ld   de,$0

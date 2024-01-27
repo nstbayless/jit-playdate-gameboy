@@ -2,7 +2,7 @@
 .define CUSTOM_RESET 1
 
 reset:
-    nop
+    call init_crc
     call main
 exit:
      stop
