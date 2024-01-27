@@ -3,6 +3,12 @@
 #include "sm38d.h"
 #include "map.h"
 
+#ifdef __GNUC__
+    #define __forceinline __attribute__((always_inline))
+#elif !defined(_MSC_VER)
+    #define __forceinline
+#endif
+
 /*
     Useful resources when developing this JIT:
     - Arm v7-m architecture reference manual: 
@@ -39,8 +45,8 @@
             - (similarly, some registers might not be written to jit_regfile_t in the epilogue if they are not modified this chunk)
         - dynamic recompiling is done by translating in the following passes:
             1. Fragmentation: each sm83 instruction is converted into multiple "translation fragments," or just "fragments" for short (frag_t).
-                - a fragment (frag_t) is a representation of an arm operation.
-                - for example, it could represent a single 16-bit thumb instruction, or it could be "call a function at a particular address" (which takes several instructions)
+                - a fragment (frag_t) is a representation of an operation in arm state.
+                - for example, a fragment could represent a single 16-bit thumb instruction, or it could be "call a function at a particular address" (a multi-instruction operation)
                 - some fragments are added at the start and end as prologue/epilogue.
                 - during this step, we keep track of what arm registers are "used," "input," and "dirty" (aka "output").
                     - "used": the arm register was either 
@@ -79,7 +85,7 @@
 */
 
 #ifndef JIT_DEBUG
-    #define JIT_DEBUG
+    //#define JIT_DEBUG
 #endif
 
 #define SETFLAGS 1
@@ -251,6 +257,11 @@ typedef enum
 
 static jit_opts opts;
 static jit_ht_entry* jit_hashtable[JIT_HASHTABLE_SIZE];
+static jit_ht_entry jit_default_entry = {
+    .addr = 0,
+    .bank = 0,
+    .fn = NULL
+};
 
 static void* arm_interworking_none(void* addr)
 {
@@ -286,7 +297,7 @@ static void jit_add_ht_entry(uint16_t gb_addr, uint16_t gb_bank, jit_fn fn)
     jit_ht_entry* prev = jit_hashtable[hash_entry];
     
     uint16_t prev_size = 0;
-    for (const jit_ht_entry* p = prev; p && p->fn; ++p)
+    for (const jit_ht_entry* p = prev; p != &jit_default_entry && p->fn; ++p)
     {
         prev_size++;
     }
@@ -310,19 +321,17 @@ static void jit_add_ht_entry(uint16_t gb_addr, uint16_t gb_bank, jit_fn fn)
     n[prev_size+1].fn = NULL;
     
     jit_hashtable[hash_entry] = n;
-    if (prev)
+    if (prev != &jit_default_entry)
     {
         free(prev);
     }
 }
 
 // gets jit fn if it exists, otherwise returns NULL.
-static jit_fn get_jit_fn(uint16_t gb_addr, uint16_t gb_bank)
+static inline __forceinline jit_fn get_jit_fn(uint16_t gb_addr, uint16_t gb_bank)
 {
     uint16_t hash_entry = (gb_addr) % JIT_HASHTABLE_SIZE;
     jit_ht_entry* e = jit_hashtable[hash_entry];
-    
-    if (!e) return NULL;
     
     while (e->fn)
     {
@@ -344,7 +353,10 @@ void jit_init(jit_opts _opts)
 {
     opts = _opts;
     //JIT_DEBUG_MESSAGE("memset.\n");
-    memset(jit_hashtable, 0, sizeof(jit_hashtable));
+    for (size_t i = 0; i < JIT_HASHTABLE_SIZE; ++i)
+    {
+        jit_hashtable[i] = &jit_default_entry;
+    }
     //JIT_DEBUG_MESSAGE("memfix.\n");
     jit_memfix();
 }
@@ -353,7 +365,7 @@ void jit_cleanup(void)
 {
     for (size_t i = 0; i < JIT_HASHTABLE_SIZE; ++i)
     {
-        if (jit_hashtable[i])
+        if (jit_hashtable[i] != &jit_default_entry)
         {
             for (jit_ht_entry* e = jit_hashtable[i]; e->fn; ++e)
             {
@@ -397,6 +409,7 @@ static struct {
     const uint8_t* romstart;
     const uint8_t* rom;
     const uint8_t* romend;
+    const uint8_t* initrom; // ptr to rom of start of 
     uint16_t pcstart;
     uint32_t cycles;
 
@@ -1387,8 +1400,11 @@ static void frag_post_readwrite_hlm(void)
     
     frag_armpop(REGS_NONFLEX & 0xF);
     
-    // we have to stop if we write to rom.
-    if (!opts.fixed_bank) dis.done = 1;
+    // (too improbable -- discounting this possibility.)
+    #if 0
+        // we have to stop if we write to rom, for fear of bank swap
+        if (!opts.fixed_bank) dis.done = 1;
+    #endif
 }
 
 static void frag_set_n(bool n)
@@ -1778,6 +1794,7 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
 {
     if (src == OPARG_B && dst == OPARG_B && opts.ld_b_b)
     {
+        // ld b,b is a breakpoint.
         frag_delegate(opts.ld_b_b);
         dis.done = 1;
         return;
@@ -1956,6 +1973,8 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         // pop {...}
         frag_armpop(REGS_NONFLEX & 0xF);
         
+        // (too unlikely -- discounting this possibility)
+        #if 0
         // we have to stop now because of the possibility of a bankswap under our feet.
         if (!(dst == OPARG_i16m && sm83_addr_safe_write(immediate))
         || dst == OPARG_i8m || dst == OPARG_Cm
@@ -1963,6 +1982,13 @@ static void frag_ld(sm83_oparg_t dst, sm83_oparg_t src)
         {
             dis.done = true;
         }
+        #else
+        // vaguely plausible this could bankswap under our feet.
+        if ((dst == OPARG_i8m || dst == OPARG_i16m) && !sm83_addr_safe_write(immediate))
+        {
+            dis.done = 1;
+        }
+        #endif
     }
     else if (is_reg8(dst))
     {
@@ -2483,7 +2509,7 @@ static void frag_edi(bool enable)
     {
         // we've enabled interrupts; it's possible that
         // the game wants one to trigger after the next
-        // instruction, so we have to stop now.
+        // instruction, so we should stop now.
         dis.done = true;
     }
 }
@@ -3300,7 +3326,7 @@ static void frag_push(sm83_oparg_t src)
         if ((1 << REG_A) & 0xF & REGS_NONFLEX)
         {
             // recover r1 <- A
-            const unsigned int depth_A = __builtin_popcount(REGS_NONFLEX & 0xF & ~((1 << REG_A) - 1)) - 1;
+            const unsigned int depth_A = __builtin_popcount(REGS_NONFLEX & 0xF & ((1 << REG_A) - 1));
             
             // ldr r1, [sp, depth_A * 4]
             frag_instr16_rd0_imm8(
@@ -3366,15 +3392,15 @@ static void frag_pop(sm83_oparg_t dst)
         
         frag_bl((fn_type)opts.readword);
         
-        // adds r%sp, 2 [T2]
-        frag_add_imm16(REG_SP, REG_SP, 2);
-        
         // nh <- r0 << 7
         // (shifts 'h' to bit 12)
         frag_instr16_rd0_rm3_imm5(THUMB16_LSL_IMM, REG_NH, 0, 7);
         
         // a <- r0 >> 8
         frag_instr16_rd0_rm3_imm5(THUMB16_LSR_IMM, REG_A, 0, 8);
+        
+        // adds r%sp, 2 [T2]
+        frag_add_imm16(REG_SP, REG_SP, 2);
         
         // r0 <- r0 & 0xFF
         frag_instr16_rd0_rm3(
@@ -3448,6 +3474,19 @@ static int disassemble_done(void)
     if (dis.rom >= dis.romend - 2) return 1;
     if (dis.fragc >= 0x200) return 1;
     if (dis.next_label >= JIT_MAX_LABELS-1) return 1;
+    
+    // stop after enough sm83 instruction bytes, but prefer to stop
+    // at a consistent spot.
+    const uintptr_t sm83c = dis.rom - dis.initrom;
+    if (sm83c >= 0x18 && sm83c % 0x10 == 0)
+    {
+        return 1;
+    }
+    if (sm83c >= 0x19 && sm83c % 0x10 == 1) // some sm83 instructions are two bytes; this catches that.
+    {
+        return 1;
+    }
+    
     return dis.done;
 }
 
@@ -3470,6 +3509,7 @@ static void disassemble_begin(uint32_t gb_rom_offset, uint32_t gb_start_offset, 
     }
     dis.fragc = JIT_START_PADDING_ENTRY_C;
     dis.rom = (const uint8_t*)opts.rom + gb_rom_offset;
+    dis.initrom = dis.rom;
     dis.romend = (const uint8_t*)opts.rom + gb_end_offset;
     dis.romstart = (const uint8_t*)opts.rom + gb_start_offset;
 }
@@ -4805,7 +4845,7 @@ static void* disassemble_end(void)
         return NULL;
     }
     
-    JIT_DEBUG_MESSAGE("base address: %8p", out);
+    JIT_DEBUG_MESSAGE("base address: %8p; gb addr: %04x", out, (uintptr_t)(dis.initrom - dis.romstart));
     uint16_t* outb = out;
     
     for (size_t i = 0; i < dis.fragc; ++i)

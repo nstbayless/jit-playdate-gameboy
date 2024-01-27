@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# usage:
+# ./qemu.sh [--debug]
+
 PORT=1248
 
 killall qemu-system-arm

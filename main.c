@@ -218,8 +218,15 @@ static void test_illegal(void)
     printf("ILLEGAL\n");
 }
 
+const uint8_t* current_rom=NULL;
+
 static uint8_t test_read(uint16_t addr)
 {
+    if (addr < 0xC000)
+    {
+        // XXX
+        return current_rom[addr];
+    }
     if (addr >= 0xC000 && addr < 0xE000)
     {
         return wram[addr - 0xC000];
@@ -245,12 +252,14 @@ static void test_write(uint16_t addr, uint8_t value)
 
 static uint16_t test_read_word(uint16_t addr)
 {
-    return test_read(addr) | (test_read(addr + 1) << 8);
+    uint16_t value = test_read(addr) | (test_read(addr + 1) << 8);
+    //printf("read word: %04X->%04X\n", (unsigned int) addr, (unsigned int)value);
+    return value;
 }
 
 static void test_write_word(uint16_t addr, uint16_t value)
 {
-    printf("write word: %04X->%04X\n", (unsigned int) value, (unsigned int)addr);
+    //printf("write word: %04X<-%04X\n", (unsigned int)addr, (unsigned int)value);
     test_write(addr, value & 0xff);
     test_write(addr+1, value >> 8);
 }
@@ -260,8 +269,13 @@ static void spin(void)
     for (size_t i = 0; i < 0x40000; ++i) asm("nop");
 }
 
-void do_test(const uint8_t* rom)
+static bool do_print = true;
+
+typedef void (*cb_t)(jit_opts*);
+
+void do_test(const uint8_t* rom, cb_t cb)
 {
+    current_rom = rom;
     jit_opts opts = {
         .rom = rom,
         .pc = 0,
@@ -293,26 +307,25 @@ void do_test(const uint8_t* rom)
     #ifdef __arm__
     while (!halt)
     {
-        bool _print = true;
-        if (regs.pc == 0x80)
-        {
-            const char str[2] = {regs.a, 0x0};
-            printf("%s", str);
-            _print = false;
-        }
+        bool _print = do_print;
+        if (cb) cb(&opts);
         
         if (_print) printf("Getting jit at %x.\n", regs.pc);
-        spin();
+        if (_print) spin();
         jit_fn fn = jit_get(regs.pc, 0);
         if (_print) printf("Done.\n");
-        spin();
+        if (_print) spin();
         if (fn)
         {
+            if (regs.pc == 0x4C1)
+            {
+                printf("de %x\n", regs.de);
+            }
             if (_print) printf("invoking %04x @0x%p.\n", regs.pc, (void*)fn);
-            spin();
+            if (_print) spin();
             fn(&regs);
             if (_print) printf("Done.\n");
-            spin();
+            if (_print) spin();
         }
         else
         {
@@ -345,6 +358,46 @@ void printregs(void)
     printf("status:      %2X\n", (int)jit_regfile_p_get_f(&regs));
 }
 
+void blargg_print_checksum(void)
+{
+    printf("checksum: %x%x%x%x\n", hram[0], hram[1], hram[2], hram[3]);
+}
+
+void blargg_print_cb(jit_opts* opts)
+{
+    if (regs.pc == 0x80)
+    // see 'jit_test.s'
+    {
+        char s[2] = {regs.a, 0x0};
+        printf("%s", s);
+        //printf("  o:%x\n", regs.a);
+    }
+    if (regs.pc == 0x2C4)
+    // print_str_hl
+    {
+        //printf("print_str_hl~\n");
+        //printf("hl: %x\n", regs.hl);
+        //printf(  "[0]:%x\n", test_read(regs.hl));
+    }
+    if (regs.pc == 0x2C7)
+    {
+        //printf("1-hl: %x\n", regs.hl);
+        //printf("   a: %x\n", regs.a);
+    }
+    if (regs.pc == 0x2CA)
+    {
+        //printf("0-hl: %x\n", regs.hl);
+    }
+    if (regs.pc == 0x4B2)
+    {
+        printf("de: %x\n", regs.de);
+    }
+    if (regs.pc == 0x4C7)
+    {
+        blargg_print_checksum();
+    }
+}
+
 #ifdef TARGET_QEMU
 int main(int argc, char** argv)
 {
@@ -364,10 +417,10 @@ int eventHandler
 
         #if 0
         printf("Nop:\n");
-        do_test(gbrom_nop);
+        do_test(gbrom_nop, NULL);
         
         printf("Ld:\n");
-        do_test(gbrom_ld);
+        do_test(gbrom_ld, NULL);
         
         #ifdef __arm__
         printf("register a:  %2X\n", regs.a);
@@ -380,7 +433,7 @@ int eventHandler
         #endif
         
         printf("Transfer:\n");
-        do_test(gbrom_transfer);
+        do_test(gbrom_transfer, NULL);
         #ifdef __arm__
         printf("register a:  %2X\n", regs.a);
         printf("register bc: %4X\n", regs.bc);
@@ -394,7 +447,7 @@ int eventHandler
         #endif
         
         printf("Mem Access:\n");
-        do_test(gbrom_memaccess);
+        do_test(gbrom_memaccess, NULL);
         #ifdef __arm__
         printf("register a:  %2X\n", regs.a);
         printf("register bc: %4X\n", regs.bc);
@@ -406,7 +459,7 @@ int eventHandler
         #endif
         
         printf("Bit Math:\n");
-        do_test(gbrom_bitmath_inc);
+        do_test(gbrom_bitmath_inc, NULL);
         #ifdef __arm__
         printf("register a:  %2X\n", regs.a);
         printf("register bc: %4X\n", regs.bc);
@@ -420,7 +473,7 @@ int eventHandler
         #endif
         
         printf("Rotate:\n");
-        do_test(gbrom_rotate);
+        do_test(gbrom_rotate, NULL);
         #ifdef __arm__
         printf("register a:  %2X\n", regs.a);
         printf("register bc: %4X\n", regs.bc);
@@ -435,7 +488,7 @@ int eventHandler
         #endif
         
         printf("Stack:\n");
-        do_test(gbrom_stack);
+        do_test(gbrom_stack, NULL);
         #ifdef __arm__
         printf("hram[7d-7e]: %2X\n", test_read_word(0xfffd));
         printf("hram[7b-7c]: %2X\n", test_read_word(0xfffb));
@@ -452,7 +505,7 @@ int eventHandler
         #endif
         
         printf("Jump:\n");
-        do_test(gbrom_jump);
+        do_test(gbrom_jump, NULL);
         #ifdef __arm__
         printregs();
         jit_assert(regs.a  == 0x0);
@@ -462,14 +515,18 @@ int eventHandler
         #endif
         
         #if 0
-        printf("test_basic:");
-        do_test(test_12_gb);
+        printf("test_basic:\n");
+        do_test(test_12_gb, blargg_print_cb);
         jit_assert(regs.a  == 0x0);
         #endif
         
-        printf("test_special:");
-        do_test(test_1_gb);
+        #if 1
+        printf("test_special:\n");
+        do_print = false;
+        do_test(test_1_gb, blargg_print_cb);
+        do_print = true;
         jit_assert(regs.a  == 0x0);
+        #endif
     }
     return 0;
 }
